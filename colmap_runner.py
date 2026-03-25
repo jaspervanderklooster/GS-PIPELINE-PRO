@@ -74,9 +74,14 @@ def _env_colmap_bin() -> Optional[str]:
 
 def _run(cmd: List[str], cwd: Optional[Path] = None) -> None:
     print("RUN:", " ".join(shlex.quote(x) for x in cmd))
-    res = subprocess.run(cmd, cwd=str(cwd) if cwd else None, shell=False)
+    res = subprocess.run(cmd, cwd=str(cwd) if cwd else None, shell=False, capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError(f"Command failed (rc={res.returncode}): {' '.join(cmd)}")
+        raise RuntimeError(
+            "Command failed "
+            f"(rc={res.returncode}): {' '.join(cmd)}\n"
+            f"stdout:\n{(res.stdout or '').strip()}\n"
+            f"stderr:\n{(res.stderr or '').strip()}"
+        )
 
 
 def run_colmap(
@@ -85,6 +90,7 @@ def run_colmap(
     preset: str = "standard",
     input_type: str = "photoset",
     colmap_bin: Optional[str] = None,
+    force_cpu: bool = False,
 ) -> Path:
     """Execute COLMAP pipeline and return fused pointcloud (PLY) path."""
     if preset not in COLMAP_PRESET_ARGS:
@@ -113,6 +119,9 @@ def run_colmap(
     for k, v in preset_args.items():
         if k.startswith("SiftExtraction."):
             feat_cmd.extend([f"--{k}", str(v).lower() if isinstance(v, bool) else str(v)])
+    if force_cpu:
+        # Verify flag names with local COLMAP version; adjust if needed.
+        feat_cmd.extend(["--SiftExtraction.use_gpu", "false"])
     _run(feat_cmd, cwd=workspace)
 
     matcher = "sequential_matcher" if input_type == "video" else "exhaustive_matcher"
@@ -148,6 +157,9 @@ def run_colmap(
     for k, v in preset_args.items():
         if k.startswith("PatchMatchStereo."):
             pms_cmd.extend([f"--{k}", str(v).lower() if isinstance(v, bool) else str(v)])
+    if force_cpu:
+        # Verify flag names with local COLMAP version; adjust if needed.
+        pms_cmd.extend(["--PatchMatchStereo.use_gpu", "false"])
     _run(pms_cmd, cwd=workspace)
 
     fusion_cmd = [colmap_bin, "stereo_fusion", "--workspace_path", str(workspace), "--output_path", str(fused_ply)]

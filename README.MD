@@ -1,5 +1,7 @@
 # GS_PIPELINE-PRO
 
+Branch note (setup/colmap-fallback-and-config): worker paths/presets are now config-driven and COLMAP has automatic GPU→CPU fallback.
+
 GS_PIPELINE-PRO is an internal, human-friendly pipeline for turning photo sets and videos into high-quality Gaussian Splats.
 
 The goal is simple:

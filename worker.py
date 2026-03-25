@@ -15,20 +15,22 @@ from preprocessor import (
     detect_input_type,
 )
 from colmap_runner import run_colmap as run_colmap_pipeline
+from utils.config import get_config
 
-BASE = Path(r"D:\GS_PIPELINE")
-PROCESSING = BASE / "processing"
-ARCHIVE_DONE = BASE / "archive" / "done"
-ARCHIVE_FAILED = BASE / "archive" / "failed"
-OUTPUT = BASE / "output"
-OUTBOX = BASE / "outbox"
-LOGS = BASE / "logs"
-TEMP = BASE / "temp"
+cfg = get_config()
+GS_ROOT = Path(cfg.get("GS_ROOT", r"D:\GS_PIPELINE"))
+PROCESSING = Path(cfg.get("PROCESSING", str(GS_ROOT / "processing")))
+ARCHIVE_DONE = Path(cfg.get("ARCHIVE_DONE", str(GS_ROOT / "archive" / "done")))
+ARCHIVE_FAILED = Path(cfg.get("ARCHIVE_FAILED", str(GS_ROOT / "archive" / "failed")))
+OUTPUT = Path(cfg.get("OUTPUT", str(GS_ROOT / "output")))
+OUTBOX = Path(cfg.get("OUTBOX", str(GS_ROOT / "outbox")))
+LOGS = Path(cfg.get("LOG_DIR", str(GS_ROOT / "logs")))
+TEMP = Path(cfg.get("TEMP", str(GS_ROOT / "temp")))
 STATUS_META_DIR = TEMP / "status_meta"
-CLEANUP_QUEUE = BASE / "cleanup_queue"
+CLEANUP_QUEUE = Path(cfg.get("CLEANUP_QUEUE", str(GS_ROOT / "cleanup_queue")))
 
-LICHTFELD_EXE = Path(r"C:\LichtFeld-Studio\build\Release\LichtFeld-Studio.exe")
-COLMAP_BIN = None
+LICHTFELD_EXE = Path(cfg.get("LIGHTFELD_BIN", r"C:\LichtFeld-Studio\build\Release\LichtFeld-Studio.exe"))
+COLMAP_BIN = cfg.get("COLMAP_BIN")
 
 POLL_SECONDS = 5
 MIN_REGISTERED_IMAGES = 30
@@ -48,7 +50,7 @@ VALID_STATES = {
     "failed",
 }
 
-LF_PRESET = {
+DEFAULT_LF_PRESETS = {
     "standard": {
         "iter": 22000,
         "strategy": "mcmc",
@@ -68,6 +70,13 @@ LF_PRESET = {
         "extra_flags": ["--enable-mip"],
     },
 }
+
+_raw_presets = cfg.get("PRESETS") or cfg.get("LF_PRESETS") or {}
+if "lichtfeld_presets" in _raw_presets:
+    PRESETS = _raw_presets.get("lichtfeld_presets") or {}
+else:
+    PRESETS = _raw_presets
+_PRESETS_WARNING_EMITTED = False
 
 
 def iso_now() -> str:
@@ -199,6 +208,12 @@ def cleanup_expired_status_files():
 
 def translate_failure(stage: str, error: str) -> tuple[str, str, str]:
     text = (error or "").lower()
+    if "fallback geprobeerd" in text:
+        return (
+            "De reconstructie faalde ook na veilige terugval-instellingen.",
+            "We hebben automatisch een lichtere preset en daarna CPU-modus geprobeerd, maar zonder stabiel resultaat.",
+            "Probeer minder beelden of lagere kwaliteit; neem contact op als je wilt dat we de logs analyseren.",
+        )
     if "memory" in text or "cuda" in text or "out of memory" in text:
         return (
             "De verwerking vroeg meer geheugen dan nu beschikbaar is.",
@@ -335,14 +350,28 @@ def archive_dir_for_state(state: str) -> Path:
 
 
 def resolve_effective_preset(job: dict) -> tuple[str, dict, dict]:
+    global _PRESETS_WARNING_EMITTED
     requested = str(job.get("preset") or "standard").strip().lower()
     if requested == "good":
         requested = "standard"
     elif requested == "high":
         requested = "hq"
-    if requested not in LF_PRESET:
+    source_presets = PRESETS or DEFAULT_LF_PRESETS
+    if not PRESETS and not _PRESETS_WARNING_EMITTED:
+        print("WARNING: PRESETS ontbreekt in config; fallback naar interne defaults. Vul config/presets.yaml in.")
+        _PRESETS_WARNING_EMITTED = True
+    if requested not in source_presets:
         requested = "standard"
-    cfg = dict(LF_PRESET[requested])
+    base_defaults = {
+        "iter": 22000,
+        "strategy": "mcmc",
+        "tile_mode": 1,
+        "resize_factor": "auto",
+        "max_width": 3200,
+        "max_cap": 650000,
+        "extra_flags": [],
+    }
+    cfg = {**base_defaults, **dict(source_presets[requested])}
     scaling = {
         "requested": requested,
         "effective": requested,
@@ -384,56 +413,80 @@ def map_colmap_preset(value: str) -> str:
 
 
 
-# --- BEGIN: GPU check + COLMAP fallback wrapper ---
-def gpu_free_mb() -> int | None:
-    """Return free GPU memory in MB for GPU 0 via nvidia-smi, or None if not available."""
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5
+# --- BEGIN: COLMAP fallback wrapper ---
+def _is_gpu_related_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    markers = ("cuda", "out of memory", "memory", "out of mem", "cudaerror")
+    return any(marker in text for marker in markers)
+
+
+def run_colmap_with_fallback(job_path: Path, image_dir: Path, workspace: Path, requested_preset: str) -> Path:
+    """
+    Run COLMAP with fallback: requested preset -> standard_safe -> standard_safe + CPU-only flags.
+    """
+    job_folder = job_path.parent
+    job = ensure_job_shape(load_json(job_path))
+    input_type = job.get("input", {}).get("type", "photoset")
+    normalized_preset = map_colmap_preset(requested_preset)
+    safe_preset = "standard_safe"
+
+    def _run_attempt(preset_name: str, force_cpu: bool = False) -> Path:
+        log(job_folder, f"COLMAP attempt: preset={preset_name}, force_cpu={force_cpu}")
+        return run_colmap_pipeline(
+            image_dir=image_dir,
+            workspace=workspace,
+            preset=preset_name,
+            input_type=input_type,
+            colmap_bin=COLMAP_BIN or os.environ.get("COLMAP_BIN") or None,
+            force_cpu=force_cpu,
         )
-        lines = [int(x.strip()) for x in r.stdout.splitlines() if x.strip()]
-        return lines[0] if lines else None
-    except Exception:
-        return None
 
-
-def run_colmap_with_fallback(job_folder: Path, frames: Path, input_type: str, preset: str):
-    """
-    Try COLMAP with a sequence of presets, falling back on memory errors.
-    Returns (dense_dir, registered_count, fused_ply, used_preset).
-    """
-    effective = map_colmap_preset(preset)
-    if effective == "hq":
-        candidates = ["hq", "hq_safe", "standard_safe", "standard"]
-    else:
-        candidates = ["standard", "standard_safe"]
-
-    last_exc = None
-    for p in candidates:
-        # Skip heavy presets if GPU memory is low
-        free = gpu_free_mb()
-        if free is not None and p in ("hq", "hq_safe") and free < 8000:
-            log(job_folder, f"Skipping preset {p} because GPU free memory low: {free} MB")
-            continue
-
-        try:
-            log(job_folder, f"Trying COLMAP with preset {p}")
-            dense_dir, reg, fused_ply = run_colmap(job_folder, frames, input_type, p)
-            log(job_folder, f"COLMAP succeeded with preset {p}")
-            return dense_dir, reg, fused_ply, p
-        except Exception as e:
-            msg = str(e).lower() if e else ""
-            log(job_folder, f"COLMAP attempt with preset {p} failed: {msg}")
-            last_exc = e
-            if "memory" in msg or "cuda" in msg or "out of memory" in msg or "cannot allocate" in msg:
-                continue
+    try:
+        fused = _run_attempt(normalized_preset, force_cpu=False)
+        job["preset_used"] = normalized_preset
+        persist_job(job_path, job)
+        return fused
+    except Exception as first_exc:
+        if not _is_gpu_related_error(first_exc):
             raise
+        log(job_folder, f"COLMAP GPU/memory fout gedetecteerd. Fallback naar {safe_preset}. Details: {first_exc}")
+        write_user_status(
+            job,
+            "Camera locaties bepalen",
+            note="GPU-limiet geraakt; we schakelen over op veilige instellingen (kan trager zijn).",
+        )
 
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("All COLMAP attempts failed.")
-# --- END: GPU check + COLMAP fallback wrapper ---
+    try:
+        fused = _run_attempt(safe_preset, force_cpu=False)
+        job["preset_used"] = safe_preset
+        job["result_summary"] = f"{job.get('result_summary') or ''} COLMAP fallback gebruikt: {normalized_preset} -> {safe_preset}.".strip()
+        persist_job(job_path, job)
+        write_user_status(
+            job,
+            "Camera locaties bepalen",
+            note=f"Fallback actief: preset verlaagd naar {safe_preset} (iets trager, mogelijk iets lagere kwaliteit).",
+        )
+        return fused
+    except Exception as second_exc:
+        log(job_folder, f"COLMAP veilige preset mislukte, probeer CPU-only fallback. Details: {second_exc}")
+
+    try:
+        fused = _run_attempt(safe_preset, force_cpu=True)
+        job["preset_used"] = safe_preset
+        job["result_summary"] = (
+            f"{job.get('result_summary') or ''} COLMAP fallback gebruikt: {normalized_preset} -> {safe_preset} -> CPU-only."
+        ).strip()
+        persist_job(job_path, job)
+        write_user_status(
+            job,
+            "Camera locaties bepalen",
+            note="Fallback actief: CPU-modus ingeschakeld (duidelijk trager, mogelijk lagere detailkwaliteit).",
+        )
+        return fused
+    except Exception as final_exc:
+        log(job_folder, f"COLMAP fallback volledig mislukt (incl. CPU-only): {final_exc}")
+        raise RuntimeError(f"COLMAP fallback geprobeerd (safe + CPU), maar mislukt: {final_exc}") from final_exc
+# --- END: COLMAP fallback wrapper ---
 def run_colmap(job_folder: Path, frames: Path, input_type: str, preset: str):
     colmap_workspace = job_folder / "colmap"
     colmap_workspace.mkdir(parents=True, exist_ok=True)
@@ -645,19 +698,21 @@ def run_preprocessing(job_folder: Path, job_path: Path, job: dict):
 
 
 def run_colmap_stage(job_folder: Path, job_path: Path, job: dict):
-    input_type = job.get("input", {}).get("type", "unknown")
     preset = map_colmap_preset(job.get("preset") or job.get("preset_used") or "standard")
 
-    # set status and start COLMAP with fallback
     set_state(job_path, job, "colmap_running")
 
     frames = frames_dir(job_folder)
-
-    dense_dir, reg, fused_ply, used_preset = run_colmap_with_fallback(job_folder, frames, input_type, preset)
-
+    colmap_workspace = job_folder / "colmap"
+    colmap_workspace.mkdir(parents=True, exist_ok=True)
+    fused_ply = run_colmap_with_fallback(job_path, frames, colmap_workspace, preset)
+    dense_dir = colmap_workspace / "dense"
+    reg = len(list(frames.glob("frame_*.jpg")))
+    latest_job = ensure_job_shape(load_json(job_path))
+    used_preset = latest_job.get("preset_used") or preset
+    job["result_summary"] = latest_job.get("result_summary")
     if used_preset != preset:
-        log(job_folder, f"Preset verlaagd van {preset} naar {used_preset} wegens geheugen/robustheid.")
-        set_state(job_path, job, "colmap_running", note=f"Preset verlaagd naar {used_preset} ivm geheugen")
+        log(job_folder, f"COLMAP fallback toegepast: gevraagd={preset}, gebruikt={used_preset}")
 
     job["artifacts"]["colmap_dense_dir"] = str(dense_dir)
     job["artifacts"]["colmap_fused_ply"] = str(fused_ply)
@@ -764,4 +819,3 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
-
