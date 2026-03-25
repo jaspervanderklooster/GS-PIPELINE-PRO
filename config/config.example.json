@@ -1,0 +1,26 @@
+{
+  "GS_ROOT": "D:\\\\GS_PIPELINE",
+  "INBOX": "D:\\\\GS_PIPELINE\\\\inbox",
+  "STAGING": "D:\\\\GS_PIPELINE\\\\staging",
+  "PROCESSING": "D:\\\\GS_PIPELINE\\\\processing",
+  "ARCHIVE_DONE": "D:\\\\GS_PIPELINE\\\\archive\\\\done",
+  "ARCHIVE_FAILED": "D:\\\\GS_PIPELINE\\\\archive\\\\failed",
+  "OUTBOX": "D:\\\\GS_PIPELINE\\\\outbox",
+  "TEMP_WATCHER_STATE": "D:\\\\GS_PIPELINE\\\\temp\\\\watcher_state\\\\intake_status",
+  "LOG_DIR": "D:\\\\GS_PIPELINE\\\\logs",
+  "CLEANUP_QUEUE": "D:\\\\GS_PIPELINE\\\\cleanup_queue",
+  "REJECTED": "D:\\\\GS_PIPELINE\\\\rejected",
+  "COLMAP_BIN": "colmap",
+  "FFMPEG_BIN": "ffmpeg",
+  "FFPROBE_BIN": "ffprobe",
+  "LIGHTFELD_BIN": "C:\\\\LichtFeld-Studio\\\\build\\\\Release\\\\LichtFeld-Studio.exe",
+  "MAGICK_BIN": "magick",
+  "REQUIRED_PYTHON": "3.12",
+  "CUDA_HINT": "12.x",
+  "LF_PRESETS": {
+    "standard": {"iter": 22000, "max_cap": 2800000, "max_width": 2800},
+    "standard_safe": {"iter": 18000, "max_cap": 1800000, "max_width": 2200},
+    "hq": {"iter": 32000, "max_cap": 4600000, "max_width": 4500},
+    "hq_safe": {"iter": 26000, "max_cap": 3200000, "max_width": 3600}
+  }
+}
