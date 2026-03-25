@@ -1,0 +1,44 @@
+# High level, human readable presets. Worker translates to technical settings.
+colmap_presets:
+  preview:
+    sift_max_num_features: 4096
+    patchmatch_iterations: 2
+    stereo_max_image_size: 1200
+  standard:
+    sift_max_num_features: 8192
+    patchmatch_iterations: 4
+    stereo_max_image_size: 2800
+  standard_safe:
+    sift_max_num_features: 6144
+    patchmatch_iterations: 3
+    stereo_max_image_size: 2200
+  hq:
+    sift_max_num_features: 16384
+    patchmatch_iterations: 6
+    stereo_max_image_size: 4500
+  hq_safe:
+    sift_max_num_features: 12288
+    patchmatch_iterations: 5
+    stereo_max_image_size: 3600
+
+lichtfeld_presets:
+  preview:
+    iter: 4000
+    max_cap: 200000
+    max_width: 800
+  standard:
+    iter: 22000
+    max_cap: 2800000
+    max_width: 2800
+  standard_safe:
+    iter: 18000
+    max_cap: 1800000
+    max_width: 2200
+  hq:
+    iter: 32000
+    max_cap: 4600000
+    max_width: 4500
+  hq_safe:
+    iter: 26000
+    max_cap: 3200000
+    max_width: 3600
