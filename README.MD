@@ -1,6 +1,6 @@
-# GS_PIPELINE_PRO
+# GS_PIPELINE-PRO
 
-GS_PIPELINE_PRO is an internal, human-friendly pipeline for turning photo sets and videos into high-quality Gaussian Splats.
+GS_PIPELINE-PRO is an internal, human-friendly pipeline for turning photo sets and videos into high-quality Gaussian Splats.
 
 The goal is simple:
 
