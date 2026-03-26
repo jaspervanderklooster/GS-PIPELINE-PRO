@@ -16,7 +16,7 @@ import shlex
 import subprocess
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 # --- Presets: human -> COLMAP parameter mapping ---
 COLMAP_PRESET_ARGS: Dict[str, Dict[str, object]] = {
@@ -86,9 +86,10 @@ def _env_colmap_bin() -> Optional[str]:
 
 def _run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[dict] = None) -> None:
     """Run a command and raise RuntimeError (with stdout/stderr) on failure.
+
     Accepts an optional env dict to override process environment (useful to set CUDA_VISIBLE_DEVICES).
-    Only passes the 'env' kwarg to subprocess.run if env is not None so that tests
-    which monkeypatch subprocess.run without an 'env' parameter still work.
+    If the underlying subprocess.run implementation doesn't accept 'env' (tests monkeypatching),
+    fall back to calling subprocess.run without it.
     """
     print("RUN:", " ".join(shlex.quote(x) for x in cmd))
 
@@ -105,8 +106,22 @@ def _run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[dict] = None)
     # remove None values
     filtered_kwargs = {k: v for k, v in run_kwargs.items() if v is not None}
 
-    # call subprocess.run with only the supported kwargs
-    res = subprocess.run(cmd, **filtered_kwargs)
+    # Try calling subprocess.run including env (if present). If a TypeError occurs
+    # complaining about an unexpected 'env' kwarg (common in test fakes), retry without it.
+    try:
+        res = subprocess.run(cmd, **filtered_kwargs)
+    except TypeError as e:
+        msg = str(e).lower()
+        if "unexpected keyword argument 'env'" in msg or "got an unexpected keyword argument 'env'" in msg or (
+            ("env" in filtered_kwargs) and ("env" in msg)
+        ):
+            # Retry without env
+            filtered_kwargs_no_env = {k: v for k, v in filtered_kwargs.items() if k != "env"}
+            print("Note: subprocess.run did not accept 'env' kwarg in this environment; retrying without env.")
+            res = subprocess.run(cmd, **filtered_kwargs_no_env)
+        else:
+            # re-raise if it's some other TypeError
+            raise
 
     out = res.stdout or ""
     err = res.stderr or ""
