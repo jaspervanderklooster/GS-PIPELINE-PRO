@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
 
+
 COLMAP_PRESET_ARGS = {
     "standard": {
         "SiftExtraction.peak_threshold": 0.01,
@@ -84,6 +85,34 @@ def _run(cmd: List[str], cwd: Optional[Path] = None) -> None:
         )
 
 
+def _colmap_help_text(colmap_bin: str, command: str) -> str:
+    """Return help text for `colmap <command> --help`. On error return empty string."""
+    try:
+        res = subprocess.run([colmap_bin, command, "--help"], capture_output=True, text=True)
+        return (res.stdout or "") + (res.stderr or "")
+    except Exception:
+        return ""
+
+
+def _colmap_has_flag(colmap_bin: str, command: str, flag: str) -> bool:
+    help_txt = _colmap_help_text(colmap_bin, command)
+    return flag in help_txt
+
+
+def _maybe_extend_with_preset_args(cmd: List[str], preset_args: Dict[str, object], colmap_bin: str, colmap_cmd: str, prefix: str) -> None:
+    """Append preset args from preset_args that start with prefix, but only if COLMAP help declares the flag."""
+    help_txt = _colmap_help_text(colmap_bin, colmap_cmd)
+    for k, v in preset_args.items():
+        if not k.startswith(prefix):
+            continue
+        flag = f"--{k}"
+        if flag in help_txt:
+            cmd.extend([flag, str(v).lower() if isinstance(v, bool) else str(v)])
+        else:
+            # silently skip unsupported options but log for visibility
+            print(f"Note: COLMAP '{colmap_cmd}' does not support {flag}; skipping.")
+
+
 def run_colmap(
     image_dir: Path,
     workspace: Path,
@@ -108,26 +137,39 @@ def run_colmap(
     workspace.mkdir(parents=True, exist_ok=True)
     db_path = workspace / "database.db"
     sparse_dir = workspace / "sparse"
-    dense_dir = workspace / "dense"
+    stereo_dir = workspace / "stereo"
     fused_ply = workspace / "fused.ply"
 
     if db_path.exists():
         print("Existing database found; removing to ensure reproducible run.")
         db_path.unlink()
 
+    #
+    # FEATURE EXTRACTION
+    #
     feat_cmd = [colmap_bin, "feature_extractor", "--database_path", str(db_path), "--image_path", str(image_dir)]
-    for k, v in preset_args.items():
-        if k.startswith("SiftExtraction."):
-            feat_cmd.extend([f"--{k}", str(v).lower() if isinstance(v, bool) else str(v)])
+    # add SiftExtraction.* options only if supported by the binary
+    _maybe_extend_with_preset_args(feat_cmd, preset_args, colmap_bin, "feature_extractor", "SiftExtraction.")
+    # GPU disabling for SIFT: prefer FeatureExtraction.use_gpu, fallback to SiftExtraction.use_gpu
     if force_cpu:
-        # Verify flag names with local COLMAP version; adjust if needed.
-        feat_cmd.extend(["--SiftExtraction.use_gpu", "false"])
+        if _colmap_has_flag(colmap_bin, "feature_extractor", "--FeatureExtraction.use_gpu"):
+            feat_cmd.extend(["--FeatureExtraction.use_gpu", "false"])
+        elif _colmap_has_flag(colmap_bin, "feature_extractor", "--SiftExtraction.use_gpu"):
+            feat_cmd.extend(["--SiftExtraction.use_gpu", "false"])
+        else:
+            print("Warning: no GPU-disable flag found for feature_extractor; continuing without forcing CPU for SIFT extraction.")
     _run(feat_cmd, cwd=workspace)
 
+    #
+    # MATCHING
+    #
     matcher = "sequential_matcher" if input_type == "video" else "exhaustive_matcher"
     match_cmd = [colmap_bin, matcher, "--database_path", str(db_path)]
     _run(match_cmd, cwd=workspace)
 
+    #
+    # MAPPER
+    #
     sparse_dir.mkdir(parents=True, exist_ok=True)
     mapper_cmd = [
         colmap_bin,
@@ -141,6 +183,7 @@ def run_colmap(
     ]
     _run(mapper_cmd, cwd=workspace)
 
+    # find model directory (sparse/0 or sparse/<first-dir>), fallback to sparse if needed
     model_dir = None
     for candidate in sorted(sparse_dir.iterdir()) if sparse_dir.exists() else []:
         if candidate.is_dir():
@@ -152,20 +195,49 @@ def run_colmap(
         model_dir = sparse_dir
     print("Using sparse model directory:", model_dir)
 
-    dense_dir.mkdir(parents=True, exist_ok=True)
-    pms_cmd = [colmap_bin, "patch_match_stereo", "--workspace_path", str(workspace)]
-    for k, v in preset_args.items():
-        if k.startswith("PatchMatchStereo."):
-            pms_cmd.extend([f"--{k}", str(v).lower() if isinstance(v, bool) else str(v)])
+    #
+    # BUILD STEREO WORKSPACE
+    #
+    stereo_dir.mkdir(parents=True, exist_ok=True)
+    max_img_size = preset_args.get("StereoFusion.max_image_size", 2000)
+    undist_cmd = [
+        colmap_bin,
+        "image_undistorter",
+        "--image_path",
+        str(image_dir),
+        "--input_path",
+        str(model_dir),
+        "--output_path",
+        str(stereo_dir),
+        "--output_type",
+        "COLMAP",
+        "--max_image_size",
+        str(max_img_size),
+    ]
+    _run(undist_cmd, cwd=workspace)
+
+    #
+    # PATCH MATCH STEREO (dense)
+    #
+    pms_cmd = [colmap_bin, "patch_match_stereo", "--workspace_path", str(stereo_dir)]
+    # add patchmatch options only if supported
+    _maybe_extend_with_preset_args(pms_cmd, preset_args, colmap_bin, "patch_match_stereo", "PatchMatchStereo.")
     if force_cpu:
-        # Verify flag names with local COLMAP version; adjust if needed.
-        pms_cmd.extend(["--PatchMatchStereo.use_gpu", "false"])
+        # If COLMAP supports an explicit use_gpu flag, prefer that.
+        if _colmap_has_flag(colmap_bin, "patch_match_stereo", "--PatchMatchStereo.use_gpu"):
+            pms_cmd.extend(["--PatchMatchStereo.use_gpu", "false"])
+        elif _colmap_has_flag(colmap_bin, "patch_match_stereo", "--PatchMatchStereo.gpu_index"):
+            pms_cmd.extend(["--PatchMatchStereo.gpu_index", "-1"])
+        else:
+            print("Warning: no GPU-disable option found for patch_match_stereo; continuing without forcing CPU for PatchMatch.")
     _run(pms_cmd, cwd=workspace)
 
-    fusion_cmd = [colmap_bin, "stereo_fusion", "--workspace_path", str(workspace), "--output_path", str(fused_ply)]
-    for k, v in preset_args.items():
-        if k.startswith("StereoFusion."):
-            fusion_cmd.extend([f"--{k}", str(v).lower() if isinstance(v, bool) else str(v)])
+    #
+    # STEREO FUSION
+    #
+    fusion_cmd = [colmap_bin, "stereo_fusion", "--workspace_path", str(stereo_dir), "--output_path", str(fused_ply)]
+    # add stereo fusion args only if supported by the binary
+    _maybe_extend_with_preset_args(fusion_cmd, preset_args, colmap_bin, "stereo_fusion", "StereoFusion.")
     _run(fusion_cmd, cwd=workspace)
 
     if not fused_ply.exists():
