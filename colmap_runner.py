@@ -85,9 +85,29 @@ def _env_colmap_bin() -> Optional[str]:
 
 
 def _run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[dict] = None) -> None:
-    """Run command, print stdout/stderr, raise RuntimeError if exit != 0."""
+    """Run a command and raise RuntimeError (with stdout/stderr) on failure.
+    Accepts an optional env dict to override process environment (useful to set CUDA_VISIBLE_DEVICES).
+    Only passes the 'env' kwarg to subprocess.run if env is not None so that tests
+    which monkeypatch subprocess.run without an 'env' parameter still work.
+    """
     print("RUN:", " ".join(shlex.quote(x) for x in cmd))
-    res = subprocess.run(cmd, cwd=str(cwd) if cwd else None, shell=False, env=env, capture_output=True, text=True)
+
+    # Build kwargs but exclude keys with value None
+    run_kwargs = {
+        "cwd": str(cwd) if cwd else None,
+        "shell": False,
+        "capture_output": True,
+        "text": True,
+    }
+    if env is not None:
+        run_kwargs["env"] = env
+
+    # remove None values
+    filtered_kwargs = {k: v for k, v in run_kwargs.items() if v is not None}
+
+    # call subprocess.run with only the supported kwargs
+    res = subprocess.run(cmd, **filtered_kwargs)
+
     out = res.stdout or ""
     err = res.stderr or ""
     if out.strip():
