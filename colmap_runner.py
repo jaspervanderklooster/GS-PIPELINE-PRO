@@ -304,7 +304,8 @@ def run_colmap(
     _run(undistort_cmd, cwd=workspace, env=env_override)
 
     # ---------------- patch_match_stereo ----------------
-    pms_cmd: List[str] = [colmap_bin, "patch_match_stereo", "--workspace_path", str(workspace)]
+    # IMPORTANT: patch_match_stereo must run in the stereo workspace
+    pms_cmd: List[str] = [colmap_bin, "patch_match_stereo", "--workspace_path", str(stereo_dir)]
     for k, v in preset_args.items():
         if k.startswith("PatchMatchStereo."):
             if _supports(pms_flags, k):
@@ -327,17 +328,18 @@ def run_colmap(
                 env_override["CUDA_VISIBLE_DEVICES"] = ""
             print("Warning: no GPU-disable option found for patch_match_stereo; using CUDA_VISIBLE_DEVICES='' to force CPU.")
 
-    _run(pms_cmd, cwd=workspace, env=env_override)
+    _run(pms_cmd, cwd=stereo_dir, env=env_override)
 
     # ---------------- stereo_fusion ----------------
-    fusion_cmd: List[str] = [colmap_bin, "stereo_fusion", "--workspace_path", str(workspace), "--output_path", str(fused_ply)]
+    # stereo_fusion must also run with the stereo workspace
+    fusion_cmd: List[str] = [colmap_bin, "stereo_fusion", "--workspace_path", str(stereo_dir), "--output_path", str(fused_ply)]
     for k, v in preset_args.items():
         if k.startswith("StereoFusion."):
             if _supports(fusion_flags, k):
                 fusion_cmd.extend([f"--{k}", _format_flag_value(v)])
             else:
                 print(f"Note: COLMAP 'stereo_fusion' does not support --{k}; skipping.")
-    _run(fusion_cmd, cwd=workspace, env=env_override)
+    _run(fusion_cmd, cwd=stereo_dir, env=env_override)
 
     if not fused_ply.exists():
         raise RuntimeError("Fusion did not produce fused.ply as expected.")
