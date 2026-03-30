@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import shutil
 import subprocess
@@ -416,96 +416,133 @@ def map_colmap_preset(value: str) -> str:
 # --- BEGIN: COLMAP fallback wrapper ---
 def _is_gpu_related_error(exc: Exception) -> bool:
     text = str(exc or "").lower()
-    markers = ("cuda", "out of memory", "memory", "out of mem", "cudaerror")
+    markers = (
+        "cuda", "out of memory", "memory", "out of mem", "cudaerror",
+        "allocation", "failed to allocate", "memory exhausted"
+    )
     return any(marker in text for marker in markers)
 
 
 def run_colmap_with_fallback(job_path: Path, image_dir: Path, workspace: Path, requested_preset: str) -> Path:
     """
-    Run COLMAP with fallback: requested preset -> standard_safe -> standard_safe + CPU-only flags.
+    Improved fallback:
+     - Try requested preset (e.g. hq)
+     - If GPU/memory error: try <requested>_safe (if present)
+     - Then try standard_safe
+     - CPU-only attempts only as very last resort
+    Records attempts in job.meta.fallback_history and sets job.preset_used on success.
     """
     job_folder = job_path.parent
     job = ensure_job_shape(load_json(job_path))
-    input_type = job.get("input", {}).get("type", "photoset")
-    normalized_preset = map_colmap_preset(requested_preset)
-    safe_preset = "standard_safe"
 
-    def _run_attempt(preset_name: str, force_cpu: bool = False) -> Path:
+    normalized_preset = map_colmap_preset(requested_preset)
+
+    # --- robustly determine safe_variant (import colmap_runner if available) ---
+    try:
+        import colmap_runner  # type: ignore
+        available_presets = set(colmap_runner.COLMAP_PRESET_ARGS.keys())
+    except Exception:
+        available_presets = set()
+    safe_variant = f"{normalized_preset}_safe" if f"{normalized_preset}_safe" in available_presets else "standard_safe"
+
+    # --- helper: free GPU memory in MB (best-effort) ---
+    def gpu_free_mb() -> int:
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode != 0:
+                return 0
+            vals = [int(x.strip()) for x in r.stdout.splitlines() if x.strip().isdigit()]
+            return max(vals) if vals else 0
+        except Exception:
+            return 0
+
+    def _attempt(preset_name: str, force_cpu: bool = False) -> Path:
         log(job_folder, f"COLMAP attempt: preset={preset_name}, force_cpu={force_cpu}")
         return run_colmap_pipeline(
             image_dir=image_dir,
             workspace=workspace,
             preset=preset_name,
-            input_type=input_type,
+            input_type=job.get("input", {}).get("type", "photoset"),
             colmap_bin=COLMAP_BIN or os.environ.get("COLMAP_BIN") or None,
             force_cpu=force_cpu,
         )
 
-    try:
-        fused = _run_attempt(normalized_preset, force_cpu=False)
-        job["preset_used"] = normalized_preset
+    # helper to record fallback attempts (with telemetry)
+    def record_attempt(preset_name: str, force_cpu: bool, success: bool, note: str = ""):
+        meta = job.setdefault("meta", {})
+        hist = meta.setdefault("fallback_history", [])
+        attempt_index = len(hist) + 1
+        gpu_at = None
+        try:
+            gpu_at = gpu_free_mb()
+        except Exception:
+            gpu_at = None
+        hist.append({
+            "attempt_index": attempt_index,
+            "preset": preset_name,
+            "force_cpu": bool(force_cpu),
+            "ts": iso_now(),
+            "success": bool(success),
+            "note": note,
+            "gpu_free_mb": gpu_at,
+        })
+        # simple retries counter
+        meta["colmap_retries"] = int(meta.get("colmap_retries", 0)) + (0 if success else 1)
+        job["meta"] = meta
         persist_job(job_path, job)
-        return fused
-    except Exception as first_exc:
-        if not _is_gpu_related_error(first_exc):
-            raise
-        log(job_folder, f"COLMAP GPU/memory fout gedetecteerd. Fallback naar {safe_preset}. Details: {first_exc}")
-        write_user_status(
-            job,
-            "Camera locaties bepalen",
-            note="GPU-limiet geraakt; we schakelen over op veilige instellingen (kan trager zijn).",
-        )
 
-    try:
-        fused = _run_attempt(safe_preset, force_cpu=False)
-        job["preset_used"] = safe_preset
-        job["result_summary"] = f"{job.get('result_summary') or ''} COLMAP fallback gebruikt: {normalized_preset} -> {safe_preset}.".strip()
-        persist_job(job_path, job)
-        write_user_status(
-            job,
-            "Camera locaties bepalen",
-            note=f"Fallback actief: preset verlaagd naar {safe_preset} (iets trager, mogelijk iets lagere kwaliteit).",
-        )
-        return fused
-    except Exception as second_exc:
-        log(job_folder, f"COLMAP veilige preset mislukte, probeer CPU-only fallback. Details: {second_exc}")
+    # Build ordered attempts
+    if normalized_preset == "hq":
+        attempts = [
+            (normalized_preset, False),
+            (safe_variant, False) if safe_variant != normalized_preset else None,
+            ("standard_safe", False),
+            (safe_variant, True),
+            ("standard_safe", True),
+        ]
+    else:
+        attempts = [
+            (normalized_preset, False),
+            ("standard_safe", False),
+            ("standard_safe", True),
+        ]
 
-    try:
-        fused = _run_attempt(safe_preset, force_cpu=True)
-        job["preset_used"] = safe_preset
-        job["result_summary"] = (
-            f"{job.get('result_summary') or ''} COLMAP fallback gebruikt: {normalized_preset} -> {safe_preset} -> CPU-only."
-        ).strip()
-        persist_job(job_path, job)
-        write_user_status(
-            job,
-            "Camera locaties bepalen",
-            note="Fallback actief: CPU-modus ingeschakeld (duidelijk trager, mogelijk lagere detailkwaliteit).",
-        )
-        return fused
-    except Exception as final_exc:
-        log(job_folder, f"COLMAP fallback volledig mislukt (incl. CPU-only): {final_exc}")
-        raise RuntimeError(f"COLMAP fallback geprobeerd (safe + CPU), maar mislukt: {final_exc}") from final_exc
+    attempts = [a for a in attempts if a]
+
+    # --- optional GPU check: if low free memory skip full 'hq' attempt ---
+    free_mb = gpu_free_mb()
+    if normalized_preset == "hq" and free_mb and free_mb < 12000:
+        log(job_folder, f"GPU free {free_mb}MB < 12000MB â€” skipping heavy 'hq' attempt and starting with safe variant.")
+        attempts = [a for a in attempts if a[0] != normalized_preset]
+
+    last_exc = None
+    for idx, (preset_name, force_cpu) in enumerate(attempts, start=1):
+        try:
+            fused = _attempt(preset_name, force_cpu=force_cpu)
+            job["preset_used"] = preset_name
+            record_attempt(preset_name, force_cpu, success=True)
+            persist_job(job_path, job)
+            return fused
+        except Exception as exc:
+            last_exc = exc
+            record_attempt(preset_name, force_cpu, success=False, note=str(exc))
+            if not _is_gpu_related_error(exc):
+                log(job_folder, f"COLMAP attempt {preset_name} failed (non-GPU error): {exc}")
+            else:
+                log(job_folder, f"COLMAP GPU/memory error on {preset_name}: {exc}")
+            # small backoff before next attempt to avoid tight failure loops
+            try:
+                time.sleep(5)
+            except Exception:
+                pass
+
+    log(job_folder, f"All COLMAP attempts failed (tried: {attempts}). Last error: {last_exc}")
+    raise RuntimeError(f"COLMAP fallback exhausted. Last error: {last_exc}") from last_exc
 # --- END: COLMAP fallback wrapper ---
-def run_colmap(job_folder: Path, frames: Path, input_type: str, preset: str):
-    colmap_workspace = job_folder / "colmap"
-    colmap_workspace.mkdir(parents=True, exist_ok=True)
-    colmap_bin = COLMAP_BIN or os.environ.get("COLMAP_BIN") or None
-    effective_preset = map_colmap_preset(preset)
-    log(job_folder, f"COLMAP start: preset={effective_preset}, input_type={input_type}, colmap_bin={colmap_bin or 'colmap'}")
-    fused_ply = run_colmap_pipeline(
-        image_dir=frames,
-        workspace=colmap_workspace,
-        preset=effective_preset,
-        input_type=input_type,
-        colmap_bin=colmap_bin,
-    )
-    dense_dir = colmap_workspace / "dense"
-    reg = len(list(frames.glob("frame_*.jpg")))
-    log(job_folder, f"COLMAP klaar: fused={fused_ply}, registered_images_estimate={reg}")
-    return dense_dir, reg, fused_ply
-
-
 def find_best_artifact(out_dir: Path) -> Path:
     for ext in [".ply", ".spz", ".sog", ".resume"]:
         cands = list(out_dir.rglob(f"*{ext}"))
@@ -706,7 +743,22 @@ def run_colmap_stage(job_folder: Path, job_path: Path, job: dict):
     colmap_workspace = job_folder / "colmap"
     colmap_workspace.mkdir(parents=True, exist_ok=True)
     fused_ply = run_colmap_with_fallback(job_path, frames, colmap_workspace, preset)
+
+    # BEGIN NEW: veilige fallback voor dense_dir
+    # Sommige COLMAP-workflows (image_undistorter -> stereo) produceren hun dense-output
+    # in <workspace>/stereo in plaats van <workspace>/dense. Worker verwacht 'dense'.
+    # We gebruiken stereo als fallback wanneer dense niet bestaat.
     dense_dir = colmap_workspace / "dense"
+    if not dense_dir.exists():
+        alt = colmap_workspace / "stereo"
+        if alt.exists():
+            log(job_folder, f"COLMAP dense dir ontbreekt; gebruik stereo dir als dense_dir: {alt}")
+            dense_dir = alt
+        else:
+            # geen dense noch stereo â€” dat is een echte fout die we propagateren
+            log(job_folder, f"COLMAP dense en stereo directories ontbreken: expected {colmap_workspace / 'dense'} or {alt}")
+            raise RuntimeError("COLMAP dense output missing for LichtFeld stage.")
+
     reg = len(list(frames.glob("frame_*.jpg")))
     latest_job = ensure_job_shape(load_json(job_path))
     used_preset = latest_job.get("preset_used") or preset
@@ -819,3 +871,4 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
+

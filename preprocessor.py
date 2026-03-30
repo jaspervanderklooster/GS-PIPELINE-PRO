@@ -1,9 +1,17 @@
+# preprocessor.py
 import shutil
 import subprocess
 import zipfile
+import logging
 from pathlib import Path
 from datetime import datetime
 
+# Pillow voor auto-orientatie / downscale
+try:
+    from PIL import Image, ImageOps
+except Exception:
+    Image = None
+    ImageOps = None
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
@@ -27,6 +35,10 @@ PRESETS = {
     },
 }
 
+# threshold/downscale defaults
+DOWNSCALE_THRESHOLD = 3500  # if width > this, downscale
+DOWNSCALE_TO = 3000         # target width after downscale
+DOWNSCALE_QUALITY = 90      # JPEG quality for downscaled images (0-100)
 
 def iso_now():
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -172,6 +184,55 @@ def unzip_if_needed(path_a: Path, path_b: Path):
     return handle_zip_inputs(path_a, path_b)
 
 
+def _auto_orient_and_downscale(path: Path, job_folder: Path,
+                               downscale_threshold: int = DOWNSCALE_THRESHOLD,
+                               downscale_to: int = DOWNSCALE_TO,
+                               quality: int = DOWNSCALE_QUALITY) -> None:
+    """Auto-orient using EXIF and downscale if image width exceeds threshold.
+    This function logs to job_folder/worker.log on error but never raises.
+    """
+    if Image is None or ImageOps is None:
+        log(job_folder, "Pillow niet beschikbaar: skip auto-orient/downscale.")
+        return
+
+    try:
+        img = Image.open(path)
+    except Exception as e:
+        log(job_folder, f"Kon afbeelding niet openen voor auto-orient: {path.name} ({e})")
+        return
+
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        # If exif_transpose fails, continue; orientation still might be correct.
+        pass
+
+    try:
+        w, h = img.size
+        if w > downscale_threshold:
+            new_w = downscale_to
+            new_h = max(1, int(h * (new_w / float(w))))
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            log(job_folder, f"Downscaled {path.name}: {w}x{h} -> {new_w}x{new_h}")
+        # Ensure correct mode for JPEG
+        ext = path.suffix.lower()
+        if ext in {".jpg", ".jpeg"}:
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            save_kwargs = {"quality": quality, "optimize": True}
+            exif = img.info.get("exif")
+            if exif:
+                save_kwargs["exif"] = exif
+            img.save(path, "JPEG", **save_kwargs)
+        elif ext == ".png":
+            img.save(path, "PNG", optimize=True)
+        else:
+            # fallback: overwrite with default format
+            img.save(path)
+    except Exception as e:
+        log(job_folder, f"Fout tijdens auto-orient/downscale voor {path.name}: {e}")
+
+
 def preprocess_photoset(job_folder: Path, src_folder: Path) -> int:
     staging = frames_dir(job_folder)
     media = collect_media_files(src_folder)
@@ -193,6 +254,13 @@ def preprocess_photoset(job_folder: Path, src_folder: Path) -> int:
                 p.unlink()
             except Exception:
                 pass
+
+        # Immediately auto-orient and optionally downscale the moved image.
+        try:
+            _auto_orient_and_downscale(target, job_folder)
+        except Exception as e:
+            # Never fail preprocessing for a single image; just log.
+            log(job_folder, f"Auto-orient/downscale error for {target.name}: {e}")
 
         moved += 1
 
@@ -280,18 +348,30 @@ def extract_frames_from_video(job_folder: Path, src_folder: Path, preset: str) -
             global_frame_idx += 1
             final_frame = staging / f"frame_{global_frame_idx:06d}.jpg"
             temp_frame.replace(final_frame)
+
+            # Auto-orient & downscale frames extracted from video as well (cheap safety).
+            try:
+                _auto_orient_and_downscale(final_frame, job_folder,
+                                           downscale_threshold=DOWNSCALE_THRESHOLD,
+                                           downscale_to=DOWNSCALE_TO)
+            except Exception as e:
+                log(job_folder, f"Auto-orient/downscale error for {final_frame.name}: {e}")
+
             extracted += 1
         total_count += extracted
         elapsed = (datetime.now() - started).total_seconds()
         log(job_folder, f"Video klaar: {video.name} duur={duration:.1f}s frames={extracted} verwerkt_in={elapsed:.1f}s")
-
     log(job_folder, f"Extracted totaal {total_count} frames uit {len(videos)} video('s) naar {staging}")
     return total_count
+
+
 def extract_sharp_frames(job_folder: Path, src_folder: Path, preset: str) -> int:
     return extract_frames_from_video(job_folder, src_folder, preset)
 
+
 def normalize_photos(job_folder: Path, src_folder: Path) -> int:
     return preprocess_photoset(job_folder, src_folder)
+
 
 def parse_preset(tag: str = "", requested_preset: str = "", explicit_preset: str = "") -> str:
     chosen = explicit_preset or requested_preset
