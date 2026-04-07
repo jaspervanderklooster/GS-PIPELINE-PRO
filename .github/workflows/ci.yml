@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/colmap-fallback-improvements
+      - fix/venv-preprocess-profiler
+
+jobs:
+  python-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\Activate.ps1
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+      - name: py_compile
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          python -m py_compile watcher.py worker.py colmap_runner.py preprocessor.py utils/colmap_profiler.py utils/chunker.py utils/gpu_monitor.py scripts/run_job.py
+      - name: smoke_colmap_fallback (best effort)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          python scripts/smoke_colmap_fallback.py

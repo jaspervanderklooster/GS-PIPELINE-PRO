@@ -10,6 +10,11 @@ sys.path.insert(0, str(repo))
 
 # worker exposes run_colmap_with_fallback(...) — same call as the smoke test
 from worker import run_colmap_with_fallback
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
 
 def main(argv):
     if len(argv) < 2:
@@ -27,6 +32,10 @@ def main(argv):
     requested_preset = job.get("preset", "standard")
     try:
         print(f"Starting job {job.get('job_id')} image_dir={image_dir} workspace={workspace} preset={requested_preset}")
+        if Image is not None:
+            print(f"PIL available: {getattr(Image, '__version__', 'unknown')}")
+        else:
+            print("Pillow not available — skipping reencode")
         fused = run_colmap_with_fallback(job_path, image_dir, workspace, requested_preset=requested_preset)
         print("JOB DONE. fused:", fused)
         return 0
