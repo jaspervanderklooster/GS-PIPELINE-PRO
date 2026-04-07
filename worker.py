@@ -15,6 +15,9 @@ from preprocessor import (
     detect_input_type,
 )
 from colmap_runner import run_colmap as run_colmap_pipeline
+from utils.colmap_profiler import choose_preset
+from utils.gpu_monitor import gpu_free_mb, monitor_peak
+from utils.chunker import chunk_images, merge_colmap_models
 from utils.config import get_config
 
 cfg = get_config()
@@ -37,6 +40,7 @@ MIN_REGISTERED_IMAGES = 30
 CLEANUP_AFTER_DAYS = 7
 MAX_LOG_TAIL = 6000
 STATUS_RETENTION_HOURS = 24
+CHUNK_THRESHOLD = int(cfg.get("CHUNK_THRESHOLD", 1500))
 
 TERMINAL_STATES = {"done", "failed"}
 VALID_STATES = {
@@ -283,6 +287,8 @@ def ensure_job_shape(job: dict) -> dict:
     job["input"].setdefault("counts", {})
     job["input"].setdefault("tag", safe_name(job["job_id"], "project"))
     job.setdefault("assessment", {})
+    job.setdefault("meta", {})
+    job["meta"].setdefault("fallback_history", [])
     return job
 
 
@@ -428,18 +434,45 @@ def run_colmap_with_fallback(job_path: Path, image_dir: Path, workspace: Path, r
     job = ensure_job_shape(load_json(job_path))
     input_type = job.get("input", {}).get("type", "photoset")
     normalized_preset = map_colmap_preset(requested_preset)
-    safe_preset = "standard_safe"
+    safe_preset = f"{normalized_preset}_safe" if normalized_preset in {"hq", "standard"} else "standard_safe"
+    if safe_preset not in {"hq_safe", "standard_safe"}:
+        safe_preset = "standard_safe"
+
+    def _record_event(preset_name: str, force_cpu: bool, success: bool, note: str, elapsed: float):
+        meta = job.setdefault("meta", {})
+        hist = meta.setdefault("fallback_history", [])
+        dims = choose_preset(job_folder)
+        event = {
+            "preset": preset_name,
+            "force_cpu": force_cpu,
+            "ts": iso_now(),
+            "success": success,
+            "note": note,
+            "num_images": dims.get("num_images", 0),
+            "max_side": dims.get("max_side", 0),
+            "gpu_free_at_start": gpu_free_mb(),
+            "gpu_peak_used": monitor_peak(os.getpid(), interval=0.2, timeout=0.6),
+            "time_taken": round(elapsed, 3),
+        }
+        hist.append(event)
 
     def _run_attempt(preset_name: str, force_cpu: bool = False) -> Path:
+        started = time.time()
         log(job_folder, f"COLMAP attempt: preset={preset_name}, force_cpu={force_cpu}")
-        return run_colmap_pipeline(
-            image_dir=image_dir,
-            workspace=workspace,
-            preset=preset_name,
-            input_type=input_type,
-            colmap_bin=COLMAP_BIN or os.environ.get("COLMAP_BIN") or None,
-            force_cpu=force_cpu,
-        )
+        try:
+            fused = run_colmap_pipeline(
+                image_dir=image_dir,
+                workspace=workspace,
+                preset=preset_name,
+                input_type=input_type,
+                colmap_bin=COLMAP_BIN or os.environ.get("COLMAP_BIN") or None,
+                force_cpu=force_cpu,
+            )
+            _record_event(preset_name, force_cpu, True, "attempt-ok", time.time() - started)
+            return fused
+        except Exception as exc:
+            _record_event(preset_name, force_cpu, False, str(exc), time.time() - started)
+            raise
 
     try:
         fused = _run_attempt(normalized_preset, force_cpu=False)
@@ -690,6 +723,12 @@ def run_preprocessing(job_folder: Path, job_path: Path, job: dict):
     elif input_type == "photoset":
         count = preprocess_photoset(job_folder, src)
         job["input"]["counts"]["photos"] = count
+        bad_dir = src / "_bad"
+        if bad_dir.exists():
+            bad_files = sorted([p.name for p in bad_dir.glob("*") if p.is_file()])
+            if bad_files:
+                job.setdefault("meta", {})
+                job["meta"]["preprocess_bad_files"] = bad_files
     else:
         raise RuntimeError(f"Unsupported input type: {input_type}")
     job["result_summary"] = f"Preprocessing complete: {count} images ready for training."
@@ -698,14 +737,32 @@ def run_preprocessing(job_folder: Path, job_path: Path, job: dict):
 
 
 def run_colmap_stage(job_folder: Path, job_path: Path, job: dict):
-    preset = map_colmap_preset(job.get("preset") or job.get("preset_used") or "standard")
+    prof = choose_preset(job_folder)
+    preset = map_colmap_preset(prof.get("preset") or job.get("preset") or job.get("preset_used") or "standard")
+    job.setdefault("meta", {})
+    job["meta"]["preset_chosen"] = prof
+    job["preset_used"] = preset
+    persist_job(job_path, job)
 
     set_state(job_path, job, "colmap_running")
 
     frames = frames_dir(job_folder)
     colmap_workspace = job_folder / "colmap"
     colmap_workspace.mkdir(parents=True, exist_ok=True)
-    fused_ply = run_colmap_with_fallback(job_path, frames, colmap_workspace, preset)
+    frame_count = len(list(frames.glob("frame_*.jpg")))
+    if frame_count > CHUNK_THRESHOLD:
+        chunk_root = job_folder / "chunks"
+        chunk_dirs = chunk_images(frames, chunk_root, chunk_size=500, overlap=50)
+        model_dirs = []
+        for idx, chunk in enumerate(chunk_dirs, start=1):
+            chunk_workspace = chunk / "workspace"
+            chunk_frames = chunk / "images"
+            log(job_folder, f"Chunk COLMAP run {idx}/{len(chunk_dirs)}: {chunk_frames}")
+            run_colmap_with_fallback(job_path, chunk_frames, chunk_workspace, preset)
+            model_dirs.append(chunk)
+        fused_ply = merge_colmap_models(model_dirs, colmap_workspace)
+    else:
+        fused_ply = run_colmap_with_fallback(job_path, frames, colmap_workspace, preset)
     dense_dir = colmap_workspace / "dense"
     reg = len(list(frames.glob("frame_*.jpg")))
     latest_job = ensure_job_shape(load_json(job_path))

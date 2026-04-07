@@ -50,8 +50,8 @@ def test_colmap_fallback_succeeds_on_cpu(tmp_path, monkeypatch):
     job = json.loads(job_path.read_text(encoding="utf-8"))
 
     assert fused == workspace / "fused.ply"
-    assert calls == [("hq", False), ("standard_safe", False), ("standard_safe", True)]
-    assert job["preset_used"] == "standard_safe"
+    assert calls == [("hq", False), ("hq_safe", False), ("hq_safe", True)]
+    assert job["preset_used"] == "hq_safe"
     assert "fallback" in (job.get("result_summary") or "").lower()
 
 

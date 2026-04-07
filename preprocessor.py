@@ -3,6 +3,14 @@ import subprocess
 import zipfile
 from pathlib import Path
 from datetime import datetime
+import os
+
+try:
+    from PIL import Image, ImageOps, UnidentifiedImageError
+except Exception:  # Pillow optioneel in sommige omgevingen
+    Image = None
+    ImageOps = None
+    UnidentifiedImageError = Exception
 
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
@@ -173,6 +181,12 @@ def unzip_if_needed(path_a: Path, path_b: Path):
 
 
 def preprocess_photoset(job_folder: Path, src_folder: Path) -> int:
+    log_pillow_status(job_folder)
+    bad_files = reencode_and_downscale(job_folder, src_folder)
+    bad_files.extend(verify_images(src_folder))
+    move_bad_files(job_folder, src_folder, bad_files)
+    run_dedupe_headless(job_folder, src_folder)
+
     staging = frames_dir(job_folder)
     media = collect_media_files(src_folder)
     photos = media["photos"]
@@ -198,6 +212,90 @@ def preprocess_photoset(job_folder: Path, src_folder: Path) -> int:
 
     log(job_folder, f"Moved {moved} photos to {staging}")
     return moved
+
+
+def log_pillow_status(job_folder: Path):
+    if Image is None:
+        log(job_folder, "Pillow not available — skipping reencode")
+        return
+    log(job_folder, f"PIL available: {getattr(Image, '__version__', 'unknown')}")
+
+
+def reencode_and_downscale(job_folder: Path, src_dir: Path, max_side: int = 3000) -> list[tuple[str, str]]:
+    if Image is None or ImageOps is None:
+        return []
+    bad: list[tuple[str, str]] = []
+    for p in sorted(src_dir.glob("*.*")):
+        if p.suffix.lower() not in ALLOWED_PHOTOS:
+            continue
+        try:
+            with Image.open(p) as im:
+                im = ImageOps.exif_transpose(im)
+                im = im.convert("RGB")
+                if max(im.size) > max_side:
+                    scale = max_side / float(max(im.size))
+                    new_size = (max(1, int(im.size[0] * scale)), max(1, int(im.size[1] * scale)))
+                    im = im.resize(new_size, Image.LANCZOS)
+                im.save(p, format="JPEG", quality=95, optimize=True)
+        except UnidentifiedImageError:
+            bad.append((p.name, "UnidentifiedImageError"))
+        except Exception as exc:
+            bad.append((p.name, str(exc)))
+    if bad:
+        log(job_folder, f"reencode/downscale detected bad files: {bad}")
+    return bad
+
+
+def verify_images(src_dir: Path) -> list[tuple[str, str]]:
+    if Image is None:
+        return []
+    bad: list[tuple[str, str]] = []
+    for f in sorted(src_dir.glob("*.*")):
+        if f.suffix.lower() not in ALLOWED_PHOTOS:
+            continue
+        try:
+            with Image.open(f) as im:
+                im.verify()
+        except Exception as exc:
+            bad.append((f.name, str(exc)))
+    return bad
+
+
+def move_bad_files(job_folder: Path, src_dir: Path, bad: list[tuple[str, str]]):
+    if not bad:
+        return
+    bad_dir = src_dir / "_bad"
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    for filename, reason in bad:
+        source = src_dir / filename
+        if not source.exists():
+            continue
+        target = bad_dir / filename
+        try:
+            shutil.move(str(source), str(target))
+            log(job_folder, f"Bad file moved: {filename} ({reason})")
+        except Exception as exc:
+            log(job_folder, f"Failed moving bad file {filename}: {exc}")
+
+
+def run_dedupe_headless(job_folder: Path, src_dir: Path):
+    script = Path(__file__).resolve().parent / "dedupe_headless.py"
+    if not script.exists():
+        return
+    out_dir = job_folder / "preprocess" / "dedupe"
+    cmd = [
+        os.environ.get("PYTHON", "python"),
+        str(script),
+        "--input-dir", str(src_dir),
+        "--output-dir", str(out_dir),
+        "--job-id", job_folder.name,
+        "--worker-log", str(job_folder / "worker.log"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log(job_folder, f"dedupe_headless failed (non-fatal): {result.stderr[-2000:]}")
+    else:
+        log(job_folder, "dedupe_headless completed.")
 
 
 def collect_video_files(src_folder: Path) -> list[Path]:
