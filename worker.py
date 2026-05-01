@@ -305,7 +305,7 @@ def set_state(job_path: Path, job: dict, new_state: str, *, note: Optional[str] 
         raise RuntimeError(f"Invalid worker state: {new_state}")
     previous = job.get("state", "queued")
     job["state"] = new_state
-    job["preset_used"] = job.get("preset") or job.get("preset_used") or "standard"
+    job["preset_used"] = job.get("preset_used") or job.get("preset") or "standard"
     if not job.get("started_at") and new_state != "queued":
         job["started_at"] = iso_now()
     if new_state in TERMINAL_STATES:
@@ -878,17 +878,21 @@ def run_colmap_stage(job_folder: Path, job_path: Path, job: dict):
     job["artifacts"]["colmap_input_frames"] = total_frames
     if ratio is not None:
         job["artifacts"]["colmap_registration_ratio"] = ratio
+    job.setdefault("meta", {})
     if isinstance(registration.get("raw"), dict):
         raw = registration["raw"]
-        if raw.get("chosen_matcher"):
-            job["artifacts"]["colmap_chosen_matcher"] = raw.get("chosen_matcher")
-        if raw.get("best_attempt"):
-            job["meta"]["colmap_best_attempt"] = raw.get("best_attempt")
+        selected_matcher = raw.get("selected_matcher") or raw.get("chosen_matcher")
+        selected_attempt = raw.get("selected_attempt") or raw.get("best_attempt")
+        if selected_matcher:
+            job["artifacts"]["colmap_selected_matcher"] = selected_matcher
+            job["artifacts"]["colmap_chosen_matcher"] = selected_matcher
+        if selected_attempt:
+            job["meta"]["colmap_selected_attempt"] = selected_attempt
+            job["meta"]["colmap_best_attempt"] = selected_attempt
         if raw.get("attempts"):
             job["meta"]["colmap_attempts"] = raw.get("attempts")
 
     job["registered_images"] = reg
-    job.setdefault("meta", {})
     job["meta"]["colmap_preset"] = used_preset
     job["preset_used"] = used_preset
 
@@ -957,10 +961,10 @@ def process_job(job_folder: Path):
     job = ensure_job_shape(load_json(job_path))
     persist_job(job_path, job)
     if job.get("state") in TERMINAL_STATES and job.get("delivery", {}).get("finalized"):
-        return
+        return job
     if job.get("state") in TERMINAL_STATES:
         finalize_terminal_job(job_folder, job_path, job)
-        return
+        return job
     normalize_resume_state(job_folder, job_path, job)
     current_state = job.get("state", "queued")
     try:
@@ -976,6 +980,7 @@ def process_job(job_folder: Path):
             current_state = job.get("state")
         if current_state == "done":
             finalize_terminal_job(job_folder, job_path, job)
+        return job
     except Exception as exc:
         stage = {
             "queued": "preprocessing",
@@ -987,6 +992,7 @@ def process_job(job_folder: Path):
         }.get(job.get("state", current_state), current_state)
         fail_job(job_path, job, stage, exc)
         finalize_terminal_job(job_folder, job_path, job)
+        return job
 
 
 def main_loop():

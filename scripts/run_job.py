@@ -18,6 +18,17 @@ except Exception:
     Image = None
 
 
+def _latest_job_snapshot(job_path: Path, returned_job, fallback_job: dict) -> dict:
+    if isinstance(returned_job, dict):
+        return ensure_job_shape(returned_job)
+    if job_path.exists():
+        try:
+            return ensure_job_shape(load_json(job_path))
+        except Exception as exc:
+            print(f"Could not reload final job.json from {job_path}: {exc}", file=sys.stderr)
+    return ensure_job_shape(dict(fallback_job))
+
+
 def main(argv):
     if len(argv) < 2:
         print("Usage: python scripts/run_job.py <job_folder>", file=sys.stderr)
@@ -38,13 +49,17 @@ def main(argv):
         else:
             print("Pillow not available in subprocess")
 
-        process_job(job_folder)
+        returned_job = process_job(job_folder)
 
-        latest = ensure_job_shape(load_json(job_path))
+        latest = _latest_job_snapshot(job_path, returned_job, job)
         state = latest.get("state")
+        delivery = latest.get("delivery") or {}
         print(f"JOB STATE after process_job: {state}")
         print(f"JOB RESULT: {latest.get('result')}")
         print(f"JOB SUMMARY: {latest.get('result_summary')}")
+        if delivery.get("archive_status") or delivery.get("archive_note"):
+            print(f"JOB ARCHIVE STATUS: {delivery.get('archive_status')}")
+            print(f"JOB ARCHIVE NOTE: {delivery.get('archive_note')}")
         return 0 if state == "done" else 1
     except Exception as exc:
         traceback.print_exc()

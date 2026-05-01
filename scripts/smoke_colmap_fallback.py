@@ -55,6 +55,15 @@ def main() -> int:
         fused = worker.run_colmap_with_fallback(job_path, frames, workspace, "hq")
         if not fused.exists() or calls["n"] != 3:
             return 1
+        latest = worker.ensure_job_shape(worker.load_json(job_path))
+        if latest.get("preset_used") != "standard_safe":
+            print(f"expected preset_used=standard_safe, got {latest.get('preset_used')}")
+            return 1
+        worker.set_state(job_path, latest, "colmap_done")
+        latest = worker.ensure_job_shape(worker.load_json(job_path))
+        if latest.get("preset_used") != "standard_safe":
+            print(f"set_state overwrote preset_used: {latest.get('preset_used')}")
+            return 1
 
     print("smoke_colmap_fallback: ok")
     return 0

@@ -101,6 +101,7 @@ POLL_SECONDS = 10
 REQUIRED_STABLE_SCANS = 3
 RECENT_TAG_COOLDOWN_MINUTES = 30
 STALE_CLAIM_MINUTES = 30
+STALE_WORKER_STARTED_MINUTES = 60
 STALE_SNAPSHOT_HOURS = 24
 ROOT_REJECT_RETENTION_HOURS = 12
 LOCK_WAIT_MINUTES = 15
@@ -540,6 +541,81 @@ def cleanup_dead_snapshot_entries(state, current_folders: list[Path]):
 def update_status_cache(state, folder: Path, status: str, message: str = ""):
     state["folder_status"][folder_key(folder)] = {"status": status, "message": message, "updated_at": now_iso()}
 
+def _job_state(job_dir: Path) -> str:
+    try:
+        job = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+        return str(job.get("state", "")).lower().strip()
+    except Exception:
+        return ""
+
+def _worker_pid_running(pid: int) -> bool | None:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return None
+        if r.returncode != 0:
+            return None
+        text = ((r.stdout or "") + "\n" + (r.stderr or "")).lower()
+        if "no tasks" in text or "geen taken" in text:
+            return False
+        return str(pid) in text
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return None
+
+def recover_stale_worker_started(job_id: str, job_dir: Path) -> bool:
+    started_file = job_dir / "worker_started"
+    if not started_file.exists():
+        return False
+
+    state = _job_state(job_dir)
+    if state in {"done", "failed"}:
+        return False
+
+    payload = {}
+    try:
+        payload = json.loads(started_file.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+
+    started_at = parse_iso(str(payload.get("started_at") or ""))
+    if not started_at:
+        try:
+            started_at = datetime.fromtimestamp(started_file.stat().st_mtime).astimezone()
+        except Exception:
+            return False
+    if now_dt() - started_at < timedelta(minutes=STALE_WORKER_STARTED_MINUTES):
+        return False
+
+    try:
+        pid = int(payload.get("pid") or 0)
+    except Exception:
+        pid = 0
+    pid_running = _worker_pid_running(pid) if pid else False
+    if pid_running is not False:
+        logging.info("Worker marker is stale for job %s, but pid %s is still active or unknown", job_id, pid)
+        return False
+
+    try:
+        started_file.unlink()
+        logging.warning("Removed stale worker_started marker for job %s; job state=%s", job_id, state or "unknown")
+        return True
+    except Exception as exc:
+        logging.warning("Could not remove stale worker_started marker for job %s: %s", job_id, exc)
+        return False
+
 # --- NEW: dispatch_job helper with venv detection ---
 def dispatch_job(job_id: str, job_dir: Path):
     """
@@ -548,6 +624,7 @@ def dispatch_job(job_id: str, job_dir: Path):
     Returns True if dispatched, False if already started or failed to start.
     """
     started_file = job_dir / "worker_started"
+    recover_stale_worker_started(job_id, job_dir)
     if started_file.exists():
         logging.info("Worker already started for job %s (marker exists)", job_id)
         return False
@@ -583,14 +660,13 @@ def dispatch_job(job_id: str, job_dir: Path):
 
     # Start subprocess, direct stdout/stderr to log file
     try:
-        f = open(log_fp, "a", encoding="utf-8")
-        # write info header to log so we can see which python and PATH used
-        f.write(f"[{now_iso()}] Starting worker subprocess with python: {python_exe}\n")
-        f.write(f"[{now_iso()}] RUNNER_SCRIPT: {runner}\n")
-        f.write(f"[{now_iso()}] PATH (head): {env.get('PATH','')[:200]}\n")
-        f.flush()
-
-        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=str(REPO_ROOT))
+        with open(log_fp, "a", encoding="utf-8") as f:
+            # write info header to log so we can see which python and PATH used
+            f.write(f"[{now_iso()}] Starting worker subprocess with python: {python_exe}\n")
+            f.write(f"[{now_iso()}] RUNNER_SCRIPT: {runner}\n")
+            f.write(f"[{now_iso()}] PATH (head): {env.get('PATH','')[:200]}\n")
+            f.flush()
+            proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=str(REPO_ROOT))
         started_payload = {"pid": proc.pid, "started_at": now_iso()}
         started_file.write_text(json.dumps(started_payload, indent=2), encoding="utf-8")
         logging.info("Dispatched worker for job %s (pid=%s) -> log=%s", job_id, proc.pid, log_fp)
@@ -598,8 +674,8 @@ def dispatch_job(job_id: str, job_dir: Path):
     except Exception as exc:
         logging.exception("Failed to dispatch worker for job %s: %s", job_id, exc)
         try:
-            f.write(f"[{now_iso()}] Failed to start worker subprocess: {exc}\n")
-            f.close()
+            with open(log_fp, "a", encoding="utf-8") as f:
+                f.write(f"[{now_iso()}] Failed to start worker subprocess: {exc}\n")
         except Exception:
             pass
         return False
