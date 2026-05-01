@@ -99,7 +99,12 @@ def _load_gray_resized(path: Path, width: int) -> np.ndarray:
     return cv2.resize(img, (width, nh), interpolation=cv2.INTER_AREA)
 
 
-def _write_outputs_atomic(output_dir: Path, result: DedupeResult) -> None:
+def _write_outputs_atomic(
+    output_dir: Path,
+    result: DedupeResult,
+    purge_temp: Path | None = None,
+    purge_name: str | None = None,
+) -> None:
     tmp = output_dir.parent / f".{output_dir.name}.tmp-{uuid.uuid4().hex}"
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "analysis.json").write_text(json.dumps(asdict(result), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -109,6 +114,8 @@ def _write_outputs_atomic(output_dir: Path, result: DedupeResult) -> None:
         f"avg_ssim={result.average_score}\nmin_ssim={result.min_score}\nmax_ssim={result.max_score}\n"
     )
     (tmp / "summary.txt").write_text(summary, encoding="utf-8")
+    if purge_temp and purge_temp.exists() and purge_name:
+        os.replace(purge_temp, tmp / purge_name)
 
     if output_dir.exists():
         shutil.rmtree(output_dir)
@@ -133,9 +140,8 @@ def run(args: argparse.Namespace) -> int:
         logging.error("No input images found")
         return 2
 
-    purge_final = output_dir / f"purged_duplicates_job_{args.job_id}"
-    purge_temp = output_dir.parent / f".{purge_final.name}.tmp-{uuid.uuid4().hex}"
-    purge_temp.mkdir(parents=True, exist_ok=True)
+    purge_name = f"purged_duplicates_job_{args.job_id}"
+    purge_temp = output_dir.parent / f".{purge_name}.tmp-{uuid.uuid4().hex}"
 
     kept: list[str] = []
     purged: list[str] = []
@@ -153,6 +159,7 @@ def run(args: argparse.Namespace) -> int:
                 purged.append(path.name)
                 if not args.dry_run:
                     if args.purge_mode == "move":
+                        purge_temp.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(path), str(purge_temp / path.name))
                     else:
                         path.unlink(missing_ok=True)
@@ -166,11 +173,8 @@ def run(args: argparse.Namespace) -> int:
                 pass
             gc.collect()
 
-        if not args.dry_run and args.purge_mode == "move":
-            if purge_final.exists():
-                shutil.rmtree(purge_final)
-            os.replace(purge_temp, purge_final)
-        else:
+        include_purge = bool(purged) and not args.dry_run and args.purge_mode == "move" and purge_temp.exists()
+        if not include_purge:
             shutil.rmtree(purge_temp, ignore_errors=True)
 
         stat_scores = [x["score"] for x in scores]
@@ -190,7 +194,7 @@ def run(args: argparse.Namespace) -> int:
             min_score=float(min(stat_scores)) if stat_scores else None,
             max_score=float(max(stat_scores)) if stat_scores else None,
         )
-        _write_outputs_atomic(output_dir, result)
+        _write_outputs_atomic(output_dir, result, purge_temp if include_purge else None, purge_name)
         logging.info("Dedupe done: kept=%s purged=%s", len(kept), len(purged))
         return 0
     except Exception as exc:
@@ -212,7 +216,8 @@ def run(args: argparse.Namespace) -> int:
             max_score=None,
             error=str(exc),
         )
-        _write_outputs_atomic(output_dir, result)
+        include_purge = bool(purged) and not args.dry_run and args.purge_mode == "move" and purge_temp.exists()
+        _write_outputs_atomic(output_dir, result, purge_temp if include_purge else None, purge_name)
         return 1
 
 

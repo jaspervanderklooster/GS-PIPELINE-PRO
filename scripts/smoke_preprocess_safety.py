@@ -44,6 +44,13 @@ def main() -> int:
             print("safety report was not recorded by stage")
             return 1
 
+        lf_cfg = {"max_width": 4500}
+        scaling = {"rules": []}
+        configured, capped = worker._cap_lichtfeld_max_width(lf_cfg, scaling)
+        if configured != 4500 or capped != worker.LICHTFELD_MAX_WIDTH_LIMIT or lf_cfg["max_width"] != 4096:
+            print(f"LichtFeld max-width cap failed: configured={configured} capped={capped} cfg={lf_cfg}")
+            return 1
+
     print("smoke_preprocess_safety: ok")
     return 0
 

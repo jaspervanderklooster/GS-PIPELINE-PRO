@@ -45,6 +45,7 @@ STATUS_RETENTION_HOURS = 24
 CPU_FALLBACK_MAX_IMAGES_STANDARD = int(cfg.get("COLMAP_CPU_FALLBACK_MAX_IMAGES_STANDARD", 450))
 CPU_FALLBACK_MAX_IMAGES_HQ = int(cfg.get("COLMAP_CPU_FALLBACK_MAX_IMAGES_HQ", 700))
 LOW_REGISTRATION_WARNING_RATIO = float(cfg.get("COLMAP_LOW_REGISTRATION_WARNING_RATIO", 0.55))
+LICHTFELD_MAX_WIDTH_LIMIT = 4096
 PREPROCESS_MAX_PHOTOS_STANDARD = int(cfg.get("PREPROCESS_MAX_PHOTOS_STANDARD", 1200))
 PREPROCESS_MAX_PHOTOS_HQ = int(cfg.get("PREPROCESS_MAX_PHOTOS_HQ", 800))
 PREPROCESS_MAX_BYTES_STANDARD = int(cfg.get("PREPROCESS_MAX_BYTES_STANDARD", 50 * 1024**3))
@@ -409,7 +410,19 @@ def resolve_effective_preset(job: dict) -> tuple[str, dict, dict]:
             cfg["max_cap"] = min(cfg["max_cap"], 850000)
             scaling["effective"] = "high_safe_450"
             scaling["rules"].append(">=450 beelden: extra afvlakking")
+    _cap_lichtfeld_max_width(cfg, scaling)
     return requested, cfg, scaling
+
+
+def _cap_lichtfeld_max_width(lf_cfg: dict, scaling: dict | None = None) -> tuple[int, int]:
+    configured = int(lf_cfg.get("max_width") or 0)
+    capped = min(configured, LICHTFELD_MAX_WIDTH_LIMIT) if configured > 0 else LICHTFELD_MAX_WIDTH_LIMIT
+    lf_cfg["max_width"] = capped
+    if configured > LICHTFELD_MAX_WIDTH_LIMIT and scaling is not None:
+        scaling["max_width_capped_from"] = configured
+        scaling["max_width_limit"] = LICHTFELD_MAX_WIDTH_LIMIT
+        scaling.setdefault("rules", []).append(f"max-width capped: {configured} -> {LICHTFELD_MAX_WIDTH_LIMIT}")
+    return configured, capped
 
 
 def map_colmap_preset(value: str) -> str:
@@ -670,6 +683,8 @@ def run_lichtfeld(job_folder: Path, job: dict, dense_dir: Path, preset: str) -> 
     job["artifacts"]["preset_requested"] = requested_preset
     job["artifacts"]["preset_effective"] = scaling["effective"]
     job["artifacts"]["preset_scaling"] = scaling
+    if scaling.get("max_width_capped_from"):
+        log(job_folder, f"LichtFeld max-width capped: {scaling['max_width_capped_from']} -> {lf_cfg['max_width']}")
     cmd = [
         str(LICHTFELD_EXE),
         "--data-path", str(dense_dir),
