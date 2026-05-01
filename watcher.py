@@ -1,8 +1,8 @@
 # watcher.py
 # Aangepaste watcher voor GS_PIPELINE-PRO
-# - probeert GS_ROOT uit utils.config
-# - dispatch_job(...) start scripts/run_job.py als subprocess per job
-# - graceful shutdown via signal handling
+# - repo-first runner-script resolutie
+# - dispatch_job start runner met repo .venv python.exe indien aanwezig
+# - intake detection, job creation en dispatch
 
 import json
 import logging
@@ -19,13 +19,8 @@ from pathlib import Path
 from preprocessor import resolve_preset
 
 # ---------- Base paths / runtime folders ----------
-# Replace previous hardcoded BASE = Path(r"D:\GS_PIPELINE") block with this.
-# This will try to read GS_ROOT from utils.config (config/config.json) and fall back to the original path.
-
 try:
-    # Prefer configured GS_ROOT if available
     from utils.config import get_config
-
     cfg = get_config() or {}
     configured_root = cfg.get("GS_ROOT") or cfg.get("GS_ROOT_PATH") or cfg.get("BASE")
     if configured_root:
@@ -33,13 +28,43 @@ try:
     else:
         BASE = Path(r"D:\GS_PIPELINE")
 except Exception:
-    # If utils.config is not available for any reason, use the default Windows path
     BASE = Path(r"D:\GS_PIPELINE")
 
-# Normalize to absolute resolved Path
 BASE = Path(BASE).expanduser().resolve()
 
-# Core runtime folders (consistent naming)
+# --- BEGIN: Runner script resolution (repo-first) ---
+try:
+    REPO_ROOT = Path(__file__).resolve().parents[0]
+except Exception:
+    REPO_ROOT = Path(r"D:\GS-PIPELINE-PRO")
+
+_runner_from_config = None
+try:
+    _runner_from_config = cfg.get("RUNNER_SCRIPT") if isinstance(cfg, dict) else None
+except Exception:
+    _runner_from_config = None
+
+if _runner_from_config:
+    RUNNER_SCRIPT = Path(str(_runner_from_config))
+else:
+    RUNNER_SCRIPT = Path(REPO_ROOT) / "scripts" / "run_job.py"
+
+COMPAT_RUNNER = Path(r"D:\scripts\run_job.py")
+if not RUNNER_SCRIPT.exists() and COMPAT_RUNNER.exists():
+    try:
+        import logging
+        logging.warning("Runner script not found at %s — using compatibility path %s", RUNNER_SCRIPT, COMPAT_RUNNER)
+    except Exception:
+        pass
+    RUNNER_SCRIPT = COMPAT_RUNNER
+
+try:
+    import logging
+    logging.debug("Using runner script: %s", RUNNER_SCRIPT)
+except Exception:
+    pass
+# --- END: Runner script resolution ---
+
 INBOX = BASE / "inbox"
 PROCESSING = BASE / "processing"
 OUTBOX = BASE / "outbox"
@@ -53,7 +78,6 @@ REJECTED_ROOT_FILES = REJECTED / "root_files"
 REJECTED_LOCKED_TOO_LONG = REJECTED / "locked_too_long"
 REJECTED_MANUAL_ATTENTION = REJECTED / "manual_attention"
 
-# Ensure essential directories exist (idempotent)
 for _p in (
     INBOX,
     PROCESSING,
@@ -71,9 +95,7 @@ for _p in (
     try:
         _p.mkdir(parents=True, exist_ok=True)
     except Exception:
-        # ignore creation errors here — watcher should handle permissions/IO issues later with logging
         pass
-# ---------- end base paths ----------
 
 POLL_SECONDS = 10
 REQUIRED_STABLE_SCANS = 3
@@ -103,21 +125,17 @@ logging.basicConfig(
     ],
 )
 
-
 def now_dt() -> datetime:
     return datetime.now().astimezone()
 
-
 def now_iso() -> str:
     return now_dt().isoformat(timespec="seconds")
-
 
 def parse_iso(value: str | None):
     try:
         return datetime.fromisoformat(value or "")
     except Exception:
         return None
-
 
 def safe_tag(name: str) -> str:
     name = (name or "").strip()
@@ -129,13 +147,11 @@ def safe_tag(name: str) -> str:
     name = name.strip("._-")
     return name or "project"
 
-
 def write_json_atomic(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
-
 
 def load_state():
     default = {
@@ -157,10 +173,8 @@ def load_state():
         state.setdefault(k, v.copy() if isinstance(v, dict) else v)
     return state
 
-
 def save_state(state):
     write_json_atomic(STATE_FILE, state)
-
 
 def ensure_dirs():
     for p in [
@@ -169,20 +183,16 @@ def ensure_dirs():
     ]:
         p.mkdir(parents=True, exist_ok=True)
 
-
 def owner_outbox(owner: str) -> Path:
     d = OUTBOX / owner
     d.mkdir(parents=True, exist_ok=True)
     return d
 
-
 def status_file(owner: str, project: str) -> Path:
     return owner_outbox(owner) / f"{safe_tag(project)}_status.txt"
 
-
 def status_meta(owner: str, project: str) -> Path:
     return STATUS_META_DIR / owner / f"{safe_tag(project)}.json"
-
 
 def write_status(owner: str, project: str, status: str, *, reason: str | None = None,
                  explanation: str | None = None, advice: str | None = None,
@@ -213,7 +223,6 @@ def write_status(owner: str, project: str, status: str, *, reason: str | None = 
     }
     write_json_atomic(status_meta(owner, project), meta)
 
-
 def cleanup_expired_status_files():
     if not STATUS_META_DIR.exists():
         return
@@ -231,14 +240,11 @@ def cleanup_expired_status_files():
         except Exception:
             continue
 
-
 def claim_file_path(folder: Path) -> Path:
     return folder / CLAIM_FILENAME
 
-
 def is_claimed(folder: Path) -> bool:
     return claim_file_path(folder).exists()
-
 
 def read_claim(folder: Path) -> dict:
     p = claim_file_path(folder)
@@ -254,7 +260,6 @@ def read_claim(folder: Path) -> dict:
         return {}
     return data
 
-
 def write_claim(folder: Path, *, tag: str, preset: str, owner: str):
     claim_file_path(folder).write_text(
         f"claimed_at={now_iso()}\n"
@@ -263,7 +268,6 @@ def write_claim(folder: Path, *, tag: str, preset: str, owner: str):
         f"owner={owner}\n",
         encoding="utf-8",
     )
-
 
 def list_supported_files(folder: Path):
     files = []
@@ -275,7 +279,6 @@ def list_supported_files(folder: Path):
             if p.suffix.lower() in ALLOWED_EXTENSIONS:
                 files.append(p)
     return sorted(files, key=lambda p: str(p).lower())
-
 
 def folder_snapshot(folder: Path):
     files = list_supported_files(folder)
@@ -290,10 +293,8 @@ def folder_snapshot(folder: Path):
         newest_mtime = max(newest_mtime, st.st_mtime)
     return {"file_count": len(files), "total_size": total_size, "newest_mtime": newest_mtime}
 
-
 def snapshot_equals(a, b):
     return a.get("file_count") == b.get("file_count") and a.get("total_size") == b.get("total_size") and float(a.get("newest_mtime", 0)) == float(b.get("newest_mtime", 0))
-
 
 def snapshot_signature(snap: dict) -> dict:
     return {
@@ -302,10 +303,8 @@ def snapshot_signature(snap: dict) -> dict:
         "newest_mtime": float(snap.get("newest_mtime", 0.0)),
     }
 
-
 def folder_key(folder: Path) -> str:
     return str(folder.resolve())
-
 
 def detect_counts(folder: Path) -> dict:
     counts = {"photos": 0, "videos": 0, "zips": 0}
@@ -319,7 +318,6 @@ def detect_counts(folder: Path) -> dict:
             counts["zips"] += 1
     return counts
 
-
 def detect_input_type(counts: dict) -> str:
     photos = counts.get("photos", 0)
     videos = counts.get("videos", 0)
@@ -331,7 +329,6 @@ def detect_input_type(counts: dict) -> str:
     if zips > 0 and photos == 0 and videos == 0:
         return "archive"
     return "unknown"
-
 
 def get_video_duration_seconds(video_path: Path) -> float | None:
     try:
@@ -346,7 +343,6 @@ def get_video_duration_seconds(video_path: Path) -> float | None:
         return float((r.stdout or "").strip())
     except Exception:
         return None
-
 
 def assess_dataset(folder: Path, preset: str) -> dict:
     files = list_supported_files(folder)
@@ -401,7 +397,6 @@ def assess_dataset(folder: Path, preset: str) -> dict:
         "message": message,
     }
 
-
 def build_job_payload(job_id: str, tag: str, raw_dir: Path, preset: str, counts: dict, input_type: str, owner: str, assessment: dict, auto_bundled: bool = False) -> dict:
     input_counts = dict(counts or {})
     input_counts["video_count"] = int(assessment.get("video_count") or input_counts.get("videos") or 0)
@@ -428,10 +423,8 @@ def build_job_payload(job_id: str, tag: str, raw_dir: Path, preset: str, counts:
         "artifacts": {},
     }
 
-
 def generate_job_id(tag: str) -> str:
     return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}"
-
 
 def determine_preset(tag: str) -> str:
     resolved = resolve_preset(tag=tag, requested_preset="")
@@ -440,7 +433,6 @@ def determine_preset(tag: str) -> str:
     if resolved == "good":
         return "standard"
     return DEFAULT_PRESET
-
 
 def active_tags_in_processing() -> set[str]:
     tags = set()
@@ -462,7 +454,6 @@ def active_tags_in_processing() -> set[str]:
             tags.add(tag)
     return tags
 
-
 def probe_file_access(file_path: Path) -> tuple[bool, str]:
     try:
         file_path.stat()
@@ -476,7 +467,6 @@ def probe_file_access(file_path: Path) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"unexpected_error: {exc}"
 
-
 def probe_folder_accessibility(folder: Path) -> tuple[bool, list[dict]]:
     problems = []
     for p in list_supported_files(folder):
@@ -484,7 +474,6 @@ def probe_folder_accessibility(folder: Path) -> tuple[bool, list[dict]]:
         if not ok:
             problems.append({"path": str(p), "name": p.name, "reason": reason})
     return len(problems) == 0, problems
-
 
 def move_to_rejected_file(item: Path, rejected_dir: Path, payload: dict) -> Path:
     rejected_dir.mkdir(parents=True, exist_ok=True)
@@ -495,7 +484,6 @@ def move_to_rejected_file(item: Path, rejected_dir: Path, payload: dict) -> Path
     write_json_atomic(dest.parent / f"{dest.name}.reject.json", payload)
     return dest
 
-
 def move_folder_to_rejected(folder: Path, rejected_dir: Path, payload: dict) -> Path:
     rejected_dir.mkdir(parents=True, exist_ok=True)
     dest = rejected_dir / folder.name
@@ -505,16 +493,13 @@ def move_folder_to_rejected(folder: Path, rejected_dir: Path, payload: dict) -> 
     write_json_atomic(dest.parent / f"{dest.name}.reject.json", payload)
     return dest
 
-
 def prune_recent_tags(state):
     cutoff = now_dt() - timedelta(minutes=RECENT_TAG_COOLDOWN_MINUTES)
     state["recent_tags"] = {k: v for k, v in state["recent_tags"].items() if (parse_iso(v) and parse_iso(v) >= cutoff)}
 
-
 def prune_warned_loose_files(state):
     cutoff = now_dt() - timedelta(hours=ROOT_REJECT_RETENTION_HOURS)
     state["warned_loose_files"] = {k: v for k, v in state["warned_loose_files"].items() if (parse_iso(v) and parse_iso(v) >= cutoff)}
-
 
 def prune_stale_snapshots(state):
     cutoff = now_dt() - timedelta(hours=STALE_SNAPSHOT_HOURS)
@@ -522,15 +507,12 @@ def prune_stale_snapshots(state):
     state["lock_blocked"] = {k: v for k, v in state["lock_blocked"].items() if (parse_iso(v.get("last_seen", "")) and parse_iso(v.get("last_seen", "")) >= cutoff)}
     state["folder_status"] = {k: v for k, v in state["folder_status"].items() if (parse_iso(v.get("last_seen", "")) and parse_iso(v.get("last_seen", "")) >= cutoff)}
 
-
 def tag_is_recent(state, tag: str) -> bool:
     ts = parse_iso(state["recent_tags"].get(tag))
     return bool(ts and ts >= (now_dt() - timedelta(minutes=RECENT_TAG_COOLDOWN_MINUTES)))
 
-
 def mark_tag_recent(state, tag: str):
     state["recent_tags"][tag] = now_iso()
-
 
 def owner_dirs():
     owners = []
@@ -538,7 +520,6 @@ def owner_dirs():
         if item.is_dir() and not item.name.startswith("."):
             owners.append(item)
     return sorted(owners, key=lambda p: p.name.lower())
-
 
 def folder_candidates():
     cands = []
@@ -549,7 +530,6 @@ def folder_candidates():
     cands.sort(key=lambda pair: str(pair[1]).lower())
     return cands
 
-
 def cleanup_dead_snapshot_entries(state, current_folders: list[Path]):
     current_keys = {folder_key(p) for p in current_folders}
     state["folder_snapshots"] = {k: v for k, v in state["folder_snapshots"].items() if k in current_keys}
@@ -557,12 +537,10 @@ def cleanup_dead_snapshot_entries(state, current_folders: list[Path]):
     state["lock_blocked"] = {k: v for k, v in state["lock_blocked"].items() if k in current_keys}
     state["folder_status"] = {k: v for k, v in state["folder_status"].items() if k in current_keys}
 
-
 def update_status_cache(state, folder: Path, status: str, message: str = ""):
     state["folder_status"][folder_key(folder)] = {"status": status, "message": message, "updated_at": now_iso()}
 
-
-# --- NEW: dispatch_job helper ---
+# --- NEW: dispatch_job helper with venv detection ---
 def dispatch_job(job_id: str, job_dir: Path):
     """
     Start a worker subprocess for the given job_dir.
@@ -577,10 +555,26 @@ def dispatch_job(job_id: str, job_dir: Path):
     log_fp = job_dir / "worker_subprocess.log"
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    python_exe = sys.executable
-    repo_root = Path(__file__).resolve().parents[1]
-    runner = repo_root / "scripts" / "run_job.py"
+    # Prefer repo .venv python if present (Windows and Unix paths)
+    venv_py_windows = Path(REPO_ROOT) / ".venv" / "Scripts" / "python.exe"
+    venv_py_unix = Path(REPO_ROOT) / ".venv" / "bin" / "python"
 
+    if venv_py_windows.exists():
+        python_exe = str(venv_py_windows)
+    elif venv_py_unix.exists():
+        python_exe = str(venv_py_unix)
+    else:
+        python_exe = sys.executable
+
+    # Prepare environment for subprocess: prepend venv bin to PATH so DLLs and scripts resolve
+    env = os.environ.copy()
+    try:
+        venv_bin = str(Path(python_exe).parent)
+        env["PATH"] = venv_bin + os.pathsep + env.get("PATH", "")
+    except Exception:
+        pass
+
+    runner = RUNNER_SCRIPT
     if not runner.exists():
         logging.error("Runner script not found: %s", runner)
         return False
@@ -590,7 +584,13 @@ def dispatch_job(job_id: str, job_dir: Path):
     # Start subprocess, direct stdout/stderr to log file
     try:
         f = open(log_fp, "a", encoding="utf-8")
-        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=os.environ.copy())
+        # write info header to log so we can see which python and PATH used
+        f.write(f"[{now_iso()}] Starting worker subprocess with python: {python_exe}\n")
+        f.write(f"[{now_iso()}] RUNNER_SCRIPT: {runner}\n")
+        f.write(f"[{now_iso()}] PATH (head): {env.get('PATH','')[:200]}\n")
+        f.flush()
+
+        proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=str(REPO_ROOT))
         started_payload = {"pid": proc.pid, "started_at": now_iso()}
         started_file.write_text(json.dumps(started_payload, indent=2), encoding="utf-8")
         logging.info("Dispatched worker for job %s (pid=%s) -> log=%s", job_id, proc.pid, log_fp)
@@ -626,7 +626,6 @@ def evaluate_folder_stability(state, folder: Path):
         return False, snap, stable_count
     return stable_count >= REQUIRED_STABLE_SCANS, snap, stable_count
 
-
 def try_recover_stale_claim(folder: Path, active_tags: set[str]):
     if not is_claimed(folder):
         return False
@@ -639,7 +638,6 @@ def try_recover_stale_claim(folder: Path, active_tags: set[str]):
         return False
     claim_file_path(folder).unlink(missing_ok=True)
     return True
-
 
 def create_job_from_folder(folder: Path, owner: str, tag: str, preset: str, assessment: dict, auto_bundled: bool = False):
     job_id = generate_job_id(tag)
@@ -657,7 +655,6 @@ def create_job_from_folder(folder: Path, owner: str, tag: str, preset: str, asse
     job = build_job_payload(job_id, tag, raw_dir, preset, counts, input_type, owner, assessment, auto_bundled)
     write_json_atomic(job_dir / "job.json", job)
     return job_id, input_type, counts
-
 
 def bundle_owner_loose_files(state: dict, owner_dir: Path):
     files = [p for p in owner_dir.iterdir() if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS]
@@ -681,8 +678,6 @@ def bundle_owner_loose_files(state: dict, owner_dir: Path):
         write_json_atomic(container / ".auto_bundle.json", {"created_at": now_iso(), "note": note})
         created.append(container)
 
-    # Intake business rule: zo min mogelijk verrassingen.
-    # Alleen echt gemengde losse input gaat naar manual attention.
     if videos and not photos and not zips:
         state.get("manual_attention_alerts", {}).pop(owner_dir.name, None)
         for video in videos:
@@ -709,9 +704,7 @@ def bundle_owner_loose_files(state: dict, owner_dir: Path):
         "source_path": str(item),
         "status": "moved_to_rejected_root_files",
     }
-    # (This part is not used here — preserved earlier behaviour)
     return created
-
 
 def scan_loose_files_in_inbox_root(state):
     for item in INBOX.iterdir():
@@ -733,7 +726,6 @@ def scan_loose_files_in_inbox_root(state):
             state["warned_loose_files"][key] = now_iso()
         except Exception:
             state["warned_loose_files"][key] = now_iso()
-
 
 def process_candidates(state):
     for owner_dir in owner_dirs():
@@ -818,7 +810,6 @@ def process_candidates(state):
                 "assessment": assessment,
             })
 
-            # --- NEW: dispatch the job to a worker subprocess ---
             job_dir = PROCESSING / job_id
             dispatched = dispatch_job(job_id, job_dir)
             if dispatched:
@@ -831,25 +822,18 @@ def process_candidates(state):
             claim_file_path(folder).unlink(missing_ok=True)
             write_status(owner, folder.name, "Mislukt", reason="De intake kon niet worden klaargezet.", explanation=str(exc), advice="Probeer het opnieuw of vraag iemand om mee te kijken.", terminal=True)
 
-
-# Graceful shutdown handling
 shutdown = False
-
 
 def _handle_sig(signum, frame):
     global shutdown
     logging.info("Shutdown requested (signal=%s)", signum)
     shutdown = True
 
-
-# Register signals (best effort; works for Ctrl+C and typical termination signals)
 try:
     signal.signal(signal.SIGINT, _handle_sig)
     signal.signal(signal.SIGTERM, _handle_sig)
 except Exception:
-    # Signal registration may vary on Windows; continue without crash
     pass
-
 
 def main():
     ensure_dirs()
@@ -867,14 +851,12 @@ def main():
         except Exception as exc:
             logging.exception("Onverwachte fout in watcher-loop: %s", exc)
 
-        # Sleep in small increments to be more responsive to shutdown requests
         slept = 0
         while slept < POLL_SECONDS and not shutdown:
             time.sleep(1)
             slept += 1
 
     logging.info("Watcher wordt netjes afgesloten (graceful shutdown)")
-
 
 if __name__ == "__main__":
     main()

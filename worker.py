@@ -1,7 +1,8 @@
-﻿import json
+import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,10 @@ from preprocessor import (
 )
 from colmap_runner import run_colmap as run_colmap_pipeline
 from utils.config import get_config
+
+# Ensure helper subprocesses launched by preprocessing (notably dedupe_headless.py)
+# use the exact same interpreter as this worker subprocess.
+os.environ.setdefault("PYTHON", sys.executable)
 
 cfg = get_config()
 GS_ROOT = Path(cfg.get("GS_ROOT", r"D:\GS_PIPELINE"))
@@ -33,10 +38,13 @@ LICHTFELD_EXE = Path(cfg.get("LIGHTFELD_BIN", r"C:\LichtFeld-Studio\build\Releas
 COLMAP_BIN = cfg.get("COLMAP_BIN")
 
 POLL_SECONDS = 5
-MIN_REGISTERED_IMAGES = 30
+MIN_REGISTERED_IMAGES = int(cfg.get("COLMAP_MIN_REGISTERED_IMAGES", 30))
 CLEANUP_AFTER_DAYS = 7
 MAX_LOG_TAIL = 6000
 STATUS_RETENTION_HOURS = 24
+CPU_FALLBACK_MAX_IMAGES_STANDARD = int(cfg.get("COLMAP_CPU_FALLBACK_MAX_IMAGES_STANDARD", 450))
+CPU_FALLBACK_MAX_IMAGES_HQ = int(cfg.get("COLMAP_CPU_FALLBACK_MAX_IMAGES_HQ", 700))
+LOW_REGISTRATION_WARNING_RATIO = float(cfg.get("COLMAP_LOW_REGISTRATION_WARNING_RATIO", 0.55))
 
 TERMINAL_STATES = {"done", "failed"}
 VALID_STATES = {
@@ -61,12 +69,12 @@ DEFAULT_LF_PRESETS = {
         "extra_flags": [],
     },
     "hq": {
-        "iter": 32000,
+        "iter": 28000,
         "strategy": "mcmc",
         "tile_mode": 1,
         "resize_factor": "auto",
-        "max_width": 3840,
-        "max_cap": 1000000,
+        "max_width": 3520,
+        "max_cap": 850000,
         "extra_flags": ["--enable-mip"],
     },
 }
@@ -208,10 +216,10 @@ def cleanup_expired_status_files():
 
 def translate_failure(stage: str, error: str) -> tuple[str, str, str]:
     text = (error or "").lower()
-    if "fallback geprobeerd" in text:
+    if "fallback geprobeerd" in text or "fallback exhausted" in text:
         return (
             "De reconstructie faalde ook na veilige terugval-instellingen.",
-            "We hebben automatisch een lichtere preset en daarna CPU-modus geprobeerd, maar zonder stabiel resultaat.",
+            "We hebben automatisch lichtere varianten geprobeerd, maar zonder stabiel resultaat.",
             "Probeer minder beelden of lagere kwaliteit; neem contact op als je wilt dat we de logs analyseren.",
         )
     if "memory" in text or "cuda" in text or "out of memory" in text:
@@ -220,7 +228,7 @@ def translate_failure(stage: str, error: str) -> tuple[str, str, str]:
             "Deze dataset of kwaliteitsinstelling is te zwaar voor de huidige machine-instelling.",
             "Gebruik minder input of kies een lichtere instelling. Neem contact op als je wilt dat we meekijken.",
         )
-    if "registered only" in text or "colmap" in text:
+    if "registered only" in text or "colmap" in text or "registration ratio" in text:
         return (
             "De camera-locaties konden niet betrouwbaar worden bepaald.",
             "Er was te weinig overlap of te weinig bruikbaar beeldmateriaal om de opname goed uit te lijnen.",
@@ -283,6 +291,8 @@ def ensure_job_shape(job: dict) -> dict:
     job["input"].setdefault("counts", {})
     job["input"].setdefault("tag", safe_name(job["job_id"], "project"))
     job.setdefault("assessment", {})
+    job.setdefault("meta", {})
+    job["meta"].setdefault("fallback_history", [])
     return job
 
 
@@ -323,14 +333,6 @@ def frames_dir(job_folder: Path) -> Path:
     d = job_folder / "staging" / "frames"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-
-def colmap_paths(job_folder: Path):
-    colmap_dir = job_folder / "colmap"
-    db = colmap_dir / "database.db"
-    sparse = colmap_dir / "sparse"
-    dense = colmap_dir / "dense"
-    return colmap_dir, db, sparse, dense
 
 
 def lichtfeld_out_dir(job_id: str) -> Path:
@@ -412,8 +414,7 @@ def map_colmap_preset(value: str) -> str:
     return "standard"
 
 
-
-# --- BEGIN: COLMAP fallback wrapper ---
+# --- COLMAP helpers -------------------------------------------------
 def _is_gpu_related_error(exc: Exception) -> bool:
     text = str(exc or "").lower()
     markers = (
@@ -423,32 +424,95 @@ def _is_gpu_related_error(exc: Exception) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _estimate_prepared_image_count(job: dict, image_dir: Path) -> int:
+    try:
+        files = [p for p in image_dir.glob("frame_*") if p.is_file()]
+        if files:
+            return len(files)
+    except Exception:
+        pass
+    return int(job.get("input", {}).get("counts", {}).get("photos") or 0)
+
+
+def _cpu_fallback_allowed(job: dict, image_dir: Path, normalized_preset: str) -> tuple[bool, str]:
+    image_count = _estimate_prepared_image_count(job, image_dir)
+    limit = CPU_FALLBACK_MAX_IMAGES_HQ if normalized_preset == "hq" else CPU_FALLBACK_MAX_IMAGES_STANDARD
+    if image_count <= 0:
+        return True, "image count unknown"
+    if image_count > limit:
+        return False, f"CPU fallback skipped: {image_count} prepared images exceeds safe threshold {limit}."
+    return True, f"CPU fallback allowed for {image_count} prepared images (limit={limit})."
+
+
+def _count_registered_images_from_text_model(images_txt: Path) -> int:
+    if not images_txt.exists():
+        return 0
+    meaningful = []
+    for line in images_txt.read_text(encoding="utf-8", errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        meaningful.append(stripped)
+    if not meaningful:
+        return 0
+    return len(meaningful) // 2
+
+
+def _read_registration_summary(colmap_workspace: Path) -> dict:
+    summary_path = colmap_workspace / "registration_summary.json"
+    summary: dict = {}
+    if summary_path.exists():
+        try:
+            summary = load_json(summary_path)
+        except Exception:
+            summary = {}
+
+    text_model_dir = None
+    for candidate in [
+        summary.get("text_model_dir") if isinstance(summary, dict) else None,
+        str(colmap_workspace / "_model_txt"),
+    ]:
+        if candidate:
+            p = Path(candidate)
+            if p.exists():
+                text_model_dir = p
+                break
+
+    registered = int(summary.get("registered_images") or 0) if isinstance(summary, dict) else 0
+    if registered <= 0 and text_model_dir is not None:
+        registered = _count_registered_images_from_text_model(text_model_dir / "images.txt")
+
+    return {
+        "path": str(summary_path),
+        "exists": summary_path.exists(),
+        "registered_images": registered,
+        "raw": summary if isinstance(summary, dict) else {},
+        "text_model_dir": str(text_model_dir) if text_model_dir else None,
+    }
+
+
 def run_colmap_with_fallback(job_path: Path, image_dir: Path, workspace: Path, requested_preset: str) -> Path:
     """
-    Improved fallback:
-     - Try requested preset (e.g. hq)
-     - If GPU/memory error: try <requested>_safe (if present)
-     - Then try standard_safe
-     - CPU-only attempts only as very last resort
-    Records attempts in job.meta.fallback_history and sets job.preset_used on success.
+    GPU/memory fallback only.
+    Sparse strategy retries now belong inside colmap_runner.py itself.
+    Ordered attempts here:
+      hq -> hq_safe -> standard_safe -> standard_safe CPU (only if workload is sane)
+      standard -> standard_safe -> standard_safe CPU (only if workload is sane)
     """
     job_folder = job_path.parent
     job = ensure_job_shape(load_json(job_path))
-
     normalized_preset = map_colmap_preset(requested_preset)
 
-    # --- robustly determine safe_variant (import colmap_runner if available) ---
     try:
         import colmap_runner  # type: ignore
         available_presets = set(colmap_runner.COLMAP_PRESET_ARGS.keys())
     except Exception:
-        available_presets = set()
+        available_presets = {"standard", "standard_safe", "hq", "hq_safe"}
+
     safe_variant = f"{normalized_preset}_safe" if f"{normalized_preset}_safe" in available_presets else "standard_safe"
 
-    # --- helper: free GPU memory in MB (best-effort) ---
     def gpu_free_mb() -> int:
         try:
-            import subprocess
             r = subprocess.run(
                 ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=3,
@@ -459,6 +523,22 @@ def run_colmap_with_fallback(job_path: Path, image_dir: Path, workspace: Path, r
             return max(vals) if vals else 0
         except Exception:
             return 0
+
+    def record_attempt(preset_name: str, force_cpu: bool, success: bool, note: str = ""):
+        latest = ensure_job_shape(load_json(job_path))
+        meta = latest.setdefault("meta", {})
+        hist = meta.setdefault("fallback_history", [])
+        hist.append({
+            "attempt_index": len(hist) + 1,
+            "preset": preset_name,
+            "force_cpu": bool(force_cpu),
+            "ts": iso_now(),
+            "success": bool(success),
+            "note": note,
+            "gpu_free_mb": gpu_free_mb(),
+        })
+        latest["meta"] = meta
+        save_json_atomic(job_path, latest)
 
     def _attempt(preset_name: str, force_cpu: bool = False) -> Path:
         log(job_folder, f"COLMAP attempt: preset={preset_name}, force_cpu={force_cpu}")
@@ -471,78 +551,50 @@ def run_colmap_with_fallback(job_path: Path, image_dir: Path, workspace: Path, r
             force_cpu=force_cpu,
         )
 
-    # helper to record fallback attempts (with telemetry)
-    def record_attempt(preset_name: str, force_cpu: bool, success: bool, note: str = ""):
-        meta = job.setdefault("meta", {})
-        hist = meta.setdefault("fallback_history", [])
-        attempt_index = len(hist) + 1
-        gpu_at = None
-        try:
-            gpu_at = gpu_free_mb()
-        except Exception:
-            gpu_at = None
-        hist.append({
-            "attempt_index": attempt_index,
-            "preset": preset_name,
-            "force_cpu": bool(force_cpu),
-            "ts": iso_now(),
-            "success": bool(success),
-            "note": note,
-            "gpu_free_mb": gpu_at,
-        })
-        # simple retries counter
-        meta["colmap_retries"] = int(meta.get("colmap_retries", 0)) + (0 if success else 1)
-        job["meta"] = meta
-        persist_job(job_path, job)
+    attempts: list[tuple[str, bool]] = []
+    attempts.append((normalized_preset, False))
+    if safe_variant != normalized_preset:
+        attempts.append((safe_variant, False))
+    if safe_variant != "standard_safe":
+        attempts.append(("standard_safe", False))
 
-    # Build ordered attempts
-    if normalized_preset == "hq":
-        attempts = [
-            (normalized_preset, False),
-            (safe_variant, False) if safe_variant != normalized_preset else None,
-            ("standard_safe", False),
-            (safe_variant, True),
-            ("standard_safe", True),
-        ]
-    else:
-        attempts = [
-            (normalized_preset, False),
-            ("standard_safe", False),
-            ("standard_safe", True),
-        ]
+    allowed_cpu, cpu_reason = _cpu_fallback_allowed(job, image_dir, normalized_preset)
+    log(job_folder, cpu_reason)
+    if allowed_cpu:
+        attempts.append(("standard_safe", True))
 
-    attempts = [a for a in attempts if a]
-
-    # --- optional GPU check: if low free memory skip full 'hq' attempt ---
     free_mb = gpu_free_mb()
     if normalized_preset == "hq" and free_mb and free_mb < 12000:
-        log(job_folder, f"GPU free {free_mb}MB < 12000MB â€” skipping heavy 'hq' attempt and starting with safe variant.")
-        attempts = [a for a in attempts if a[0] != normalized_preset]
+        log(job_folder, f"GPU free {free_mb}MB < 12000MB: skip direct hq attempt and start with safer GPU preset.")
+        attempts = [a for a in attempts if a != (normalized_preset, False)]
+
+    attempts = list(dict.fromkeys(attempts))
 
     last_exc = None
-    for idx, (preset_name, force_cpu) in enumerate(attempts, start=1):
+    for preset_name, force_cpu in attempts:
         try:
             fused = _attempt(preset_name, force_cpu=force_cpu)
-            job["preset_used"] = preset_name
+            latest = ensure_job_shape(load_json(job_path))
+            latest["preset_used"] = preset_name
+            latest["result_summary"] = (
+                latest.get("result_summary")
+                or f"COLMAP succeeded with preset={preset_name} force_cpu={force_cpu}."
+            )
+            save_json_atomic(job_path, latest)
             record_attempt(preset_name, force_cpu, success=True)
-            persist_job(job_path, job)
             return fused
         except Exception as exc:
             last_exc = exc
             record_attempt(preset_name, force_cpu, success=False, note=str(exc))
             if not _is_gpu_related_error(exc):
-                log(job_folder, f"COLMAP attempt {preset_name} failed (non-GPU error): {exc}")
-            else:
-                log(job_folder, f"COLMAP GPU/memory error on {preset_name}: {exc}")
-            # small backoff before next attempt to avoid tight failure loops
-            try:
-                time.sleep(5)
-            except Exception:
-                pass
+                log(job_folder, f"COLMAP attempt failed without GPU/memory signature: {exc}")
+                raise
+            log(job_folder, f"COLMAP GPU/memory-related failure on preset={preset_name} force_cpu={force_cpu}: {exc}")
+            time.sleep(3)
 
-    log(job_folder, f"All COLMAP attempts failed (tried: {attempts}). Last error: {last_exc}")
     raise RuntimeError(f"COLMAP fallback exhausted. Last error: {last_exc}") from last_exc
-# --- END: COLMAP fallback wrapper ---
+
+
 def find_best_artifact(out_dir: Path) -> Path:
     for ext in [".ply", ".spz", ".sog", ".resume"]:
         cands = list(out_dir.rglob(f"*{ext}"))
@@ -553,7 +605,7 @@ def find_best_artifact(out_dir: Path) -> Path:
 
 
 def run_lichtfeld(job_folder: Path, job: dict, dense_dir: Path, preset: str) -> Path:
-    requested_preset, cfg, scaling = resolve_effective_preset(job)
+    requested_preset, lf_cfg, scaling = resolve_effective_preset(job)
     out_dir = lichtfeld_out_dir(job["job_id"])
     job.setdefault("artifacts", {})
     job["artifacts"]["preset_requested"] = requested_preset
@@ -564,16 +616,16 @@ def run_lichtfeld(job_folder: Path, job: dict, dense_dir: Path, preset: str) -> 
         "--data-path", str(dense_dir),
         "--output-path", str(out_dir),
         "--images", "images",
-        "--iter", str(cfg["iter"]),
-        "--strategy", str(cfg["strategy"]),
-        "--tile-mode", str(cfg["tile_mode"]),
-        "--resize_factor", str(cfg["resize_factor"]),
-        "--max-width", str(cfg["max_width"]),
-        "--max-cap", str(cfg["max_cap"]),
+        "--iter", str(lf_cfg["iter"]),
+        "--strategy", str(lf_cfg["strategy"]),
+        "--tile-mode", str(lf_cfg["tile_mode"]),
+        "--resize_factor", str(lf_cfg["resize_factor"]),
+        "--max-width", str(lf_cfg["max_width"]),
+        "--max-cap", str(lf_cfg["max_cap"]),
         "--headless",
         "--log-level", "info",
         "--log-file", str(out_dir / "lichtfeld.log"),
-    ] + list(cfg["extra_flags"])
+    ] + list(lf_cfg["extra_flags"])
     rc, _, _ = run_cmd(job_folder, cmd)
     if rc != 0:
         raise RuntimeError("LichtFeld failed.")
@@ -634,6 +686,7 @@ def deliver_job_atomically(job_folder: Path, job: dict):
     if success and artifact_path and artifact_path.exists():
         copy_if_exists(artifact_path, temp_dest / f"model{artifact_path.suffix.lower()}")
     copy_if_exists(job_folder / "worker.log", temp_dest / "worker.log")
+    copy_if_exists(job_folder / "worker_subprocess.log", temp_dest / "worker_subprocess.log")
     copy_if_exists(job_folder / "job.json", temp_dest / "job.json")
     lf_log = Path(job.get("artifacts", {}).get("lichtfeld_log", "")) if job.get("artifacts") else None
     if lf_log:
@@ -659,11 +712,33 @@ def copy_final_artifacts_into_job(job_folder: Path, job: dict):
         copy_if_exists(lf_log, final_dir / "lichtfeld.log")
 
 
-def archive_job_folder(job_folder: Path, job: dict):
+def _archive_copy_fallback(job_folder: Path, dest: Path):
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(
+        job_folder,
+        dest,
+        ignore=shutil.ignore_patterns("worker_subprocess.log", "worker_started"),
+        dirs_exist_ok=False,
+    )
+
+
+def archive_job_folder(job_folder: Path, job: dict) -> tuple[bool, str]:
     dest = archive_dir_for_state(job.get("state", "failed")) / job_folder.name
     if dest.exists():
         shutil.rmtree(dest, ignore_errors=True)
-    shutil.move(str(job_folder), str(dest))
+    try:
+        shutil.move(str(job_folder), str(dest))
+        return True, str(dest)
+    except PermissionError as exc:
+        try:
+            copy_dest = dest.parent / f"{dest.name}__copied"
+            _archive_copy_fallback(job_folder, copy_dest)
+            return False, f"archive move blocked by locked file; copied fallback to {copy_dest} ({exc})"
+        except Exception as copy_exc:
+            return False, f"archive move failed: {exc}; archive copy fallback also failed: {copy_exc}"
+    except Exception as exc:
+        return False, f"archive move failed: {exc}"
 
 
 def cleanup_job_folder(job_folder: Path, job: dict):
@@ -707,6 +782,13 @@ def run_retention_cleanup():
                 continue
 
 
+def _call_preprocess_photoset(job_folder: Path, src: Path, preset: str) -> int:
+    try:
+        return preprocess_photoset(job_folder, src, preset)
+    except TypeError:
+        return preprocess_photoset(job_folder, src)
+
+
 def run_preprocessing(job_folder: Path, job_path: Path, job: dict):
     src = Path(job.get("input", {}).get("primary", ""))
     preset = map_colmap_preset(job.get("preset") or job.get("preset_used") or "standard")
@@ -723,13 +805,36 @@ def run_preprocessing(job_folder: Path, job_path: Path, job: dict):
     job["input"]["counts"]["video_count"] = int(job["input"]["counts"].get("videos", 0))
     if input_type == "video":
         count = extract_frames_from_video(job_folder, src, preset)
-        job["input"]["counts"]["photos"] = count
     elif input_type == "photoset":
-        count = preprocess_photoset(job_folder, src)
-        job["input"]["counts"]["photos"] = count
+        count = _call_preprocess_photoset(job_folder, src, preset)
     else:
         raise RuntimeError(f"Unsupported input type: {input_type}")
-    job["result_summary"] = f"Preprocessing complete: {count} images ready for training."
+
+    summary_path = job_folder / "preprocess" / "summary.json"
+    gps_path = job_folder / "preprocess" / "gps_summary.json"
+    if summary_path.exists():
+        job["artifacts"]["preprocess_summary"] = str(summary_path)
+        try:
+            summary = load_json(summary_path)
+            job["input"]["counts"]["photos"] = int(summary.get("final_count") or count)
+            job["meta"] = job.get("meta", {})
+            job["meta"]["preprocess"] = {
+                "input_type": summary.get("input_type"),
+                "preset": summary.get("preset"),
+                "final_count": summary.get("final_count"),
+                "blur_removed": (summary.get("blur") or {}).get("removed"),
+                "dedupe_removed": (summary.get("dedupe") or {}).get("purged_count"),
+            }
+        except Exception as exc:
+            log(job_folder, f"Kon preprocess summary niet lezen: {exc}")
+            job["input"]["counts"]["photos"] = count
+    else:
+        job["input"]["counts"]["photos"] = count
+
+    if gps_path.exists():
+        job["artifacts"]["preprocess_gps_summary"] = str(gps_path)
+
+    job["result_summary"] = f"Preprocessing complete: {job['input']['counts'].get('photos', count)} images ready for training."
     persist_job(job_path, job)
     set_state(job_path, job, "ready_for_training")
 
@@ -740,14 +845,11 @@ def run_colmap_stage(job_folder: Path, job_path: Path, job: dict):
     set_state(job_path, job, "colmap_running")
 
     frames = frames_dir(job_folder)
+    total_frames = len([p for p in frames.glob("frame_*") if p.is_file()])
     colmap_workspace = job_folder / "colmap"
     colmap_workspace.mkdir(parents=True, exist_ok=True)
     fused_ply = run_colmap_with_fallback(job_path, frames, colmap_workspace, preset)
 
-    # BEGIN NEW: veilige fallback voor dense_dir
-    # Sommige COLMAP-workflows (image_undistorter -> stereo) produceren hun dense-output
-    # in <workspace>/stereo in plaats van <workspace>/dense. Worker verwacht 'dense'.
-    # We gebruiken stereo als fallback wanneer dense niet bestaat.
     dense_dir = colmap_workspace / "dense"
     if not dense_dir.exists():
         alt = colmap_workspace / "stereo"
@@ -755,27 +857,45 @@ def run_colmap_stage(job_folder: Path, job_path: Path, job: dict):
             log(job_folder, f"COLMAP dense dir ontbreekt; gebruik stereo dir als dense_dir: {alt}")
             dense_dir = alt
         else:
-            # geen dense noch stereo â€” dat is een echte fout die we propagateren
-            log(job_folder, f"COLMAP dense en stereo directories ontbreken: expected {colmap_workspace / 'dense'} or {alt}")
             raise RuntimeError("COLMAP dense output missing for LichtFeld stage.")
 
-    reg = len(list(frames.glob("frame_*.jpg")))
+    registration = _read_registration_summary(colmap_workspace)
+    reg = int(registration.get("registered_images") or 0)
+    if registration.get("exists"):
+        job["artifacts"]["colmap_registration_summary"] = registration["path"]
+    if registration.get("text_model_dir"):
+        job["artifacts"]["colmap_text_model_dir"] = registration["text_model_dir"]
+
     latest_job = ensure_job_shape(load_json(job_path))
     used_preset = latest_job.get("preset_used") or preset
-    job["result_summary"] = latest_job.get("result_summary")
     if used_preset != preset:
         log(job_folder, f"COLMAP fallback toegepast: gevraagd={preset}, gebruikt={used_preset}")
 
+    ratio = round((reg / total_frames), 4) if total_frames else None
     job["artifacts"]["colmap_dense_dir"] = str(dense_dir)
     job["artifacts"]["colmap_fused_ply"] = str(fused_ply)
     job["artifacts"]["colmap_registered_images"] = reg
-    job["registered_images"] = reg
+    job["artifacts"]["colmap_input_frames"] = total_frames
+    if ratio is not None:
+        job["artifacts"]["colmap_registration_ratio"] = ratio
+    if isinstance(registration.get("raw"), dict):
+        raw = registration["raw"]
+        if raw.get("chosen_matcher"):
+            job["artifacts"]["colmap_chosen_matcher"] = raw.get("chosen_matcher")
+        if raw.get("best_attempt"):
+            job["meta"]["colmap_best_attempt"] = raw.get("best_attempt")
+        if raw.get("attempts"):
+            job["meta"]["colmap_attempts"] = raw.get("attempts")
 
-    job["meta"] = job.get("meta", {})
+    job["registered_images"] = reg
+    job.setdefault("meta", {})
     job["meta"]["colmap_preset"] = used_preset
     job["preset_used"] = used_preset
 
-    job["result_summary"] = f"COLMAP complete: {reg} images registered."
+    if ratio is not None and ratio < LOW_REGISTRATION_WARNING_RATIO:
+        log(job_folder, f"Waarschuwing: lage COLMAP registratie-ratio ({reg}/{total_frames} = {ratio:.2%}). Dit kan ghosting of dubbele gevels veroorzaken.")
+
+    job["result_summary"] = f"COLMAP complete: {reg} registered images from {total_frames} prepared frames."
     persist_job(job_path, job)
 
     if reg < MIN_REGISTERED_IMAGES:
@@ -800,9 +920,20 @@ def run_lichtfeld_stage(job_folder: Path, job_path: Path, job: dict):
 
 
 def finalize_terminal_job(job_folder: Path, job_path: Path, job: dict):
+    delivery = job.setdefault("delivery", {})
+    if delivery.get("finalized"):
+        return
     deliver_job_atomically(job_folder, job)
-    persist_job(job_path, job)
-    archive_job_folder(job_folder, job)
+    archived, archive_note = archive_job_folder(job_folder, job)
+    delivery["finalized"] = True
+    delivery["archive_status"] = "archived" if archived else "not_archived"
+    delivery["archive_note"] = archive_note
+    job["delivery"] = delivery
+    # Persist only if the job folder still exists at original location.
+    if job_path.exists():
+        persist_job(job_path, job)
+        if not archived:
+            log(job_folder, f"Archive note: {archive_note}")
 
 
 def normalize_resume_state(job_folder: Path, job_path: Path, job: dict):
@@ -825,6 +956,8 @@ def process_job(job_folder: Path):
     job_path = job_folder / "job.json"
     job = ensure_job_shape(load_json(job_path))
     persist_job(job_path, job)
+    if job.get("state") in TERMINAL_STATES and job.get("delivery", {}).get("finalized"):
+        return
     if job.get("state") in TERMINAL_STATES:
         finalize_terminal_job(job_folder, job_path, job)
         return
@@ -871,4 +1004,3 @@ def main_loop():
 
 if __name__ == "__main__":
     main_loop()
-
