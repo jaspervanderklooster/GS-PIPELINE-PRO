@@ -607,25 +607,25 @@ def _prepare_staging_from_photos(job_folder: Path, src_folder: Path) -> int:
     staging = frames_dir(job_folder)
     media = collect_media_files(src_folder)
     photos = media["photos"]
-    moved = 0
+    staged = 0
     for idx, p in enumerate(photos, start=1):
         target = staging / f"frame_{idx:06d}{p.suffix.lower()}"
         if target.exists():
             continue
         try:
-            shutil.move(str(p), str(target))
-        except Exception:
             shutil.copy2(str(p), str(target))
-            p.unlink(missing_ok=True)
+        except Exception:
+            shutil.copy(str(p), str(target))
         _auto_orient_and_downscale(target, job_folder)
-        moved += 1
-    log(job_folder, f"Photos staged: {moved} files -> {staging}")
-    return moved
+        staged += 1
+    log(job_folder, f"Photos staged: copied={staged} source_files={len(photos)} -> {staging}")
+    return staged
 
 
 def preprocess_photoset(job_folder: Path, src_folder: Path, preset: str = "standard") -> int:
     preset_key = resolve_preset(requested_preset=preset)
     log_pillow_status(job_folder)
+    source_count = len(collect_media_files(src_folder)["photos"])
     staged_count = _prepare_staging_from_photos(job_folder, src_folder)
     staging = frames_dir(job_folder)
     bad_files = verify_images(staging)
@@ -638,7 +638,9 @@ def preprocess_photoset(job_folder: Path, src_folder: Path, preset: str = "stand
         "created_at": iso_now(),
         "input_type": "photoset",
         "preset": preset_key,
+        "source_count": source_count,
         "staged_count": staged_count,
+        "staging_mode": "copy_preserve_input_raw",
         "bad_files_moved": bad_moved,
         "blur": blur_info,
         "dedupe": {

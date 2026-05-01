@@ -45,6 +45,10 @@ STATUS_RETENTION_HOURS = 24
 CPU_FALLBACK_MAX_IMAGES_STANDARD = int(cfg.get("COLMAP_CPU_FALLBACK_MAX_IMAGES_STANDARD", 450))
 CPU_FALLBACK_MAX_IMAGES_HQ = int(cfg.get("COLMAP_CPU_FALLBACK_MAX_IMAGES_HQ", 700))
 LOW_REGISTRATION_WARNING_RATIO = float(cfg.get("COLMAP_LOW_REGISTRATION_WARNING_RATIO", 0.55))
+PREPROCESS_MAX_PHOTOS_STANDARD = int(cfg.get("PREPROCESS_MAX_PHOTOS_STANDARD", 1200))
+PREPROCESS_MAX_PHOTOS_HQ = int(cfg.get("PREPROCESS_MAX_PHOTOS_HQ", 800))
+PREPROCESS_MAX_BYTES_STANDARD = int(cfg.get("PREPROCESS_MAX_BYTES_STANDARD", 50 * 1024**3))
+PREPROCESS_MAX_BYTES_HQ = int(cfg.get("PREPROCESS_MAX_BYTES_HQ", 30 * 1024**3))
 
 TERMINAL_STATES = {"done", "failed"}
 VALID_STATES = {
@@ -216,6 +220,12 @@ def cleanup_expired_status_files():
 
 def translate_failure(stage: str, error: str) -> tuple[str, str, str]:
     text = (error or "").lower()
+    if "too large for safe preprocessing" in text or "te groot voor veilige preprocessing" in text:
+        return (
+            "De dataset is te groot voor veilige automatische preprocessing.",
+            "Na uitpakken of voorbereiden bleek de input groter dan de veilige limieten.",
+            "Splits de dataset op, gebruik minder beelden of kies een korter videofragment.",
+        )
     if "fallback geprobeerd" in text or "fallback exhausted" in text:
         return (
             "De reconstructie faalde ook na veilige terugval-instellingen.",
@@ -431,7 +441,56 @@ def _estimate_prepared_image_count(job: dict, image_dir: Path) -> int:
             return len(files)
     except Exception:
         pass
-    return int(job.get("input", {}).get("counts", {}).get("photos") or 0)
+    counts = job.get("input", {}).get("counts", {})
+    return int(counts.get("prepared_images") or counts.get("photos") or 0)
+
+
+def _folder_total_bytes(folder: Path) -> int:
+    total = 0
+    if not folder.exists():
+        return total
+    for p in folder.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _preprocess_safety_report(src: Path, counts: dict, preset: str, stage: str, prepared_images: int | None = None) -> dict:
+    normalized = map_colmap_preset(preset)
+    max_photos = PREPROCESS_MAX_PHOTOS_HQ if normalized == "hq" else PREPROCESS_MAX_PHOTOS_STANDARD
+    max_bytes = PREPROCESS_MAX_BYTES_HQ if normalized == "hq" else PREPROCESS_MAX_BYTES_STANDARD
+    photos = int(prepared_images if prepared_images is not None else counts.get("photos") or 0)
+    total_bytes = _folder_total_bytes(src)
+    reasons = []
+    if photos > max_photos:
+        reasons.append(f"{photos} images exceeds safe limit {max_photos}")
+    if total_bytes > max_bytes:
+        reasons.append(f"{total_bytes} bytes exceeds safe limit {max_bytes}")
+    return {
+        "stage": stage,
+        "classification": "too_large_for_safe_preprocessing" if reasons else "normal",
+        "reason": "; ".join(reasons) if reasons else None,
+        "counts": dict(counts or {}),
+        "prepared_images": prepared_images,
+        "total_bytes": total_bytes,
+        "preset": normalized,
+        "limits": {"photos": max_photos, "bytes": max_bytes},
+    }
+
+
+def _record_preprocess_safety(job: dict, report: dict):
+    job.setdefault("assessment", {})
+    safety = job["assessment"].setdefault("worker_preprocess_safety", {})
+    if not isinstance(safety, dict) or "classification" in safety:
+        safety = {}
+    safety[str(report.get("stage") or "unknown")] = report
+    job["assessment"]["worker_preprocess_safety"] = safety
+    job.setdefault("input", {}).setdefault("counts", {})
+    job["input"]["counts"]["total_bytes"] = int(report.get("total_bytes") or 0)
 
 
 def _cpu_fallback_allowed(job: dict, image_dir: Path, normalized_preset: str) -> tuple[bool, str]:
@@ -803,6 +862,12 @@ def run_preprocessing(job_folder: Path, job_path: Path, job: dict):
     job["input"]["type"] = input_type
     job["input"]["counts"].update(counts_after_unzip)
     job["input"]["counts"]["video_count"] = int(job["input"]["counts"].get("videos", 0))
+    unzip_safety = _preprocess_safety_report(src, counts_after_unzip, preset, "after_unzip")
+    _record_preprocess_safety(job, unzip_safety)
+    persist_job(job_path, job)
+    if unzip_safety["classification"] == "too_large_for_safe_preprocessing":
+        raise RuntimeError(f"Input too large for safe preprocessing after unzip: {unzip_safety['reason']}")
+
     if input_type == "video":
         count = extract_frames_from_video(job_folder, src, preset)
     elif input_type == "photoset":
@@ -816,23 +881,37 @@ def run_preprocessing(job_folder: Path, job_path: Path, job: dict):
         job["artifacts"]["preprocess_summary"] = str(summary_path)
         try:
             summary = load_json(summary_path)
-            job["input"]["counts"]["photos"] = int(summary.get("final_count") or count)
+            final_count = int(summary.get("final_count") or count)
+            job["input"]["counts"]["photos"] = final_count
+            job["input"]["counts"]["prepared_images"] = final_count
             job["meta"] = job.get("meta", {})
             job["meta"]["preprocess"] = {
                 "input_type": summary.get("input_type"),
                 "preset": summary.get("preset"),
-                "final_count": summary.get("final_count"),
+                "final_count": final_count,
+                "source_count": summary.get("source_count"),
+                "staging_mode": summary.get("staging_mode"),
                 "blur_removed": (summary.get("blur") or {}).get("removed"),
                 "dedupe_removed": (summary.get("dedupe") or {}).get("purged_count"),
             }
         except Exception as exc:
             log(job_folder, f"Kon preprocess summary niet lezen: {exc}")
             job["input"]["counts"]["photos"] = count
+            job["input"]["counts"]["prepared_images"] = count
     else:
         job["input"]["counts"]["photos"] = count
+        job["input"]["counts"]["prepared_images"] = count
 
     if gps_path.exists():
         job["artifacts"]["preprocess_gps_summary"] = str(gps_path)
+
+    final_count = int(job["input"]["counts"].get("prepared_images") or job["input"]["counts"].get("photos") or count)
+    final_safety = _preprocess_safety_report(src, job["input"]["counts"], preset, "after_preprocessing", prepared_images=final_count)
+    _record_preprocess_safety(job, final_safety)
+    job.setdefault("meta", {}).setdefault("preprocess", {})["safety"] = final_safety
+    if final_safety["classification"] == "too_large_for_safe_preprocessing":
+        persist_job(job_path, job)
+        raise RuntimeError(f"Input too large for safe preprocessing after preprocessing: {final_safety['reason']}")
 
     job["result_summary"] = f"Preprocessing complete: {job['input']['counts'].get('photos', count)} images ready for training."
     persist_job(job_path, job)
