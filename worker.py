@@ -118,6 +118,31 @@ def save_json_atomic(p: Path, data: dict):
     tmp.replace(p)
 
 
+def warn_status_write(target: object, exc: Exception):
+    print(f"[Worker] WARNING: status write skipped for {target}: {exc}", file=sys.stderr)
+
+
+def save_status_meta_json_atomic(p: Path, data: dict, *, replace_attempts: int = 5, retry_delay: float = 0.05):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        for attempt in range(replace_attempts):
+            try:
+                tmp.replace(p)
+                return
+            except PermissionError:
+                if attempt >= replace_attempts - 1:
+                    raise
+                time.sleep(retry_delay * (attempt + 1))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
 def log(job_folder: Path, msg: str):
     lp = job_folder / "worker.log"
     lp.parent.mkdir(parents=True, exist_ok=True)
@@ -189,15 +214,23 @@ def write_user_status(job: dict, status: str, *, reason: str | None = None,
     if note:
         lines.append(f"Opmerking: {note}")
     lines.append(f"Laatste update: {now_dt().strftime('%Y-%m-%d %H:%M')}")
-    status_file(job).write_text("\n".join(lines), encoding="utf-8")
-    save_json_atomic(status_meta(job), {
+    try:
+        sf = status_file(job)
+        sf.write_text("\n".join(lines), encoding="utf-8")
+    except Exception as exc:
+        warn_status_write("status_file", exc)
+    meta = {
         "owner": owner_of(job),
         "project": project,
         "status": status,
         "updated_at": iso_now(),
         "terminal": terminal,
         "remove_after": (now_dt() + timedelta(hours=STATUS_RETENTION_HOURS)).isoformat(timespec="seconds") if terminal else None,
-    })
+    }
+    try:
+        save_status_meta_json_atomic(status_meta(job), meta)
+    except Exception as exc:
+        warn_status_write("status_meta", exc)
 
 
 def cleanup_expired_status_files():

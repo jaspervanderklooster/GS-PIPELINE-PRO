@@ -154,6 +154,26 @@ def write_json_atomic(path: Path, data: dict):
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
+def write_status_meta_json_atomic(path: Path, data: dict, *, replace_attempts: int = 5, retry_delay: float = 0.05):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        for attempt in range(replace_attempts):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                if attempt >= replace_attempts - 1:
+                    raise
+                time.sleep(retry_delay * (attempt + 1))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
 def load_state():
     default = {
         "folder_snapshots": {},
@@ -212,7 +232,10 @@ def write_status(owner: str, project: str, status: str, *, reason: str | None = 
     if note:
         lines.append(f"Opmerking: {note}")
     lines.append(f"Laatste update: {now_dt().strftime('%Y-%m-%d %H:%M')}")
-    status_file(owner, project).write_text("\n".join(lines), encoding="utf-8")
+    try:
+        status_file(owner, project).write_text("\n".join(lines), encoding="utf-8")
+    except Exception as exc:
+        logging.warning("Status file write skipped for %s/%s: %s", owner, project, exc)
 
     meta = {
         "owner": owner,
@@ -222,7 +245,10 @@ def write_status(owner: str, project: str, status: str, *, reason: str | None = 
         "terminal": terminal,
         "remove_after": (now_dt() + timedelta(hours=STATUS_RETENTION_HOURS)).isoformat(timespec="seconds") if terminal else None,
     }
-    write_json_atomic(status_meta(owner, project), meta)
+    try:
+        write_status_meta_json_atomic(status_meta(owner, project), meta)
+    except Exception as exc:
+        logging.warning("Status meta write skipped for %s/%s: %s", owner, project, exc)
 
 def cleanup_expired_status_files():
     if not STATUS_META_DIR.exists():
