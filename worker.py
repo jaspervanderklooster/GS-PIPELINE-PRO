@@ -758,19 +758,22 @@ def deliver_job_atomically(job_folder: Path, job: dict):
     success = job.get("state") == "done"
     artifact_path = Path(job["result_artifact"]) if job.get("result_artifact") else None
     if success and artifact_path and artifact_path.exists():
-        copy_if_exists(artifact_path, temp_dest / f"model{artifact_path.suffix.lower()}")
+        delivered_artifact = final_dest / f"model{artifact_path.suffix.lower()}"
+        copy_if_exists(artifact_path, temp_dest / delivered_artifact.name)
+        job["result_artifact"] = str(delivered_artifact)
+    job.setdefault("delivery", {})
+    job["delivery"]["outbox_path"] = str(final_dest)
+    job["delivery"]["delivered_at"] = iso_now()
+    job["delivery"]["mode"] = "atomic_rename"
     copy_if_exists(job_folder / "worker.log", temp_dest / "worker.log")
     copy_if_exists(job_folder / "worker_subprocess.log", temp_dest / "worker_subprocess.log")
-    copy_if_exists(job_folder / "job.json", temp_dest / "job.json")
+    persist_job(temp_dest / "job.json", job)
     lf_log = Path(job.get("artifacts", {}).get("lichtfeld_log", "")) if job.get("artifacts") else None
     if lf_log:
         copy_if_exists(lf_log, temp_dest / "lichtfeld.log")
     write_summary_file(job, temp_dest, success=success)
     temp_dest.replace(final_dest)
-    job.setdefault("delivery", {})
-    job["delivery"]["outbox_path"] = str(final_dest)
-    job["delivery"]["delivered_at"] = iso_now()
-    job["delivery"]["mode"] = "atomic_rename"
+    return final_dest
 
 
 def copy_final_artifacts_into_job(job_folder: Path, job: dict):
@@ -1021,17 +1024,25 @@ def finalize_terminal_job(job_folder: Path, job_path: Path, job: dict):
     delivery = job.setdefault("delivery", {})
     if delivery.get("finalized"):
         return
-    deliver_job_atomically(job_folder, job)
+    outbox_path = deliver_job_atomically(job_folder, job)
+    if job_path.exists():
+        persist_job(job_path, job)
     archived, archive_note = archive_job_folder(job_folder, job)
     delivery["finalized"] = True
     delivery["archive_status"] = "archived" if archived else "not_archived"
     delivery["archive_note"] = archive_note
     job["delivery"] = delivery
+    persist_job(outbox_path / "job.json", job)
+    write_summary_file(job, outbox_path, success=job.get("state") == "done")
     # Persist only if the job folder still exists at original location.
     if job_path.exists():
         persist_job(job_path, job)
         if not archived:
             log(job_folder, f"Archive note: {archive_note}")
+    elif archived:
+        archived_job_path = Path(archive_note) / "job.json"
+        if archived_job_path.parent.exists():
+            persist_job(archived_job_path, job)
 
 
 def normalize_resume_state(job_folder: Path, job_path: Path, job: dict):
